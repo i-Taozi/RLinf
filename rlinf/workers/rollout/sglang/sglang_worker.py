@@ -464,7 +464,7 @@ class AsyncSGLangWorker(SGLangWorker):
 
     async def _loop_progress_resp(self, task_queue: AsyncTaskQueue, completion_info: CompletionInfo):
         while True:
-            self.log_info('zcy_dbg: _loop_progress_resp: wait rollout_resp')
+            self._logger.info('zcy_dbg: _loop_progress_resp: wait rollout_resp')
             rollout_resp = RolloutResp.deserialize(await self.schedule_channel.get(
                 queue_name=self.schedule_resp_rollout_queue,
                 async_op=True,
