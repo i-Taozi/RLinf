@@ -778,7 +778,7 @@ class MegatronActor(MegatronModelManager, Worker):
         return None
 
     def calc_num_microbatches(self):
-        if self.resharding_state != ReshardingState.RUN:
+        if self.use_schedule and self.resharding_state != ReshardingState.RUN:
             return
         configure_batch_sizes(
                 rank=torch.distributed.get_rank(),

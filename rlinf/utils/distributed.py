@@ -180,7 +180,6 @@ def compute_rollout_metrics_pipeline(
     adv_min, adv_max = reduce_tensor.tolist()
 
     rollout_metrics = {
-        "table": {},
         "total_num_sequence": num_seq,
         "prompt_length": sum_plen / num_seq,
         "response_length": sum_rlen / num_seq,
