@@ -15,12 +15,12 @@
 from .packed import PackedPlacementStrategy
 from .placement import Placement, PlacementStrategy
 from .utils import (
+    InferenceReq,
+    ReshardingState,
     RolloutReq,
     RolloutResp,
     ScheduleReq,
     ScheduleResp,
-    ReshardingState,
-    InferenceReq,
     TrainerReq,
     TrainerResp,
 )
@@ -31,7 +31,7 @@ __all__ = [
     "PlacementStrategy",
     "RolloutReq",
     "RolloutResp",
-    "ScheduleReq", 
+    "ScheduleReq",
     "ScheduleResp",
     "ReshardingState",
     "InferenceReq",

@@ -1,10 +1,10 @@
-from enum import Enum
 from dataclasses import dataclass
+from enum import Enum
 from typing import Literal
 
+
 class ReshardingState(Enum):
-    """
-    Resharding state for the resharding process.
+    """Resharding state for the resharding process.
     """
     DEFAULT =       0
     RESHARDING =    1

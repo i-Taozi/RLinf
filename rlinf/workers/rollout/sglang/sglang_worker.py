@@ -14,10 +14,10 @@
 
 import asyncio
 import dataclasses
-from typing import Dict, List, Tuple
-import time
-import os
 import json
+import os
+import time
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -39,6 +39,7 @@ from rlinf.workers.rollout.sglang import Engine, io_struct
 from rlinf.workers.rollout.utils import (
     print_sglang_outputs,
 )
+
 
 class MetaInfoStatsCollector:
     """Collector for SGLang meta_info statistics
@@ -439,7 +440,7 @@ class AsyncSGLangWorker(SGLangWorker):
 
     async def _loop_progress_report(self, completion_info: CompletionInfo):
         """report progress to scheduler loop"""
-        self.log_info(f'zcy_dbg: _loop_progress_report enter')
+        self.log_info('zcy_dbg: _loop_progress_report enter')
         while self.state_tag == 'running':
             await asyncio.sleep(self.progress_report_interval)
             progress_report = RolloutReq(
@@ -463,7 +464,7 @@ class AsyncSGLangWorker(SGLangWorker):
 
     async def _loop_progress_resp(self, task_queue: AsyncTaskQueue, completion_info: CompletionInfo):
         while True:
-            self._logger.info(f'zcy_dbg: _loop_progress_resp: wait rollout_resp')
+            self.log_info('zcy_dbg: _loop_progress_resp: wait rollout_resp')
             rollout_resp = RolloutResp.deserialize(await self.schedule_channel.get(
                 queue_name=self.schedule_resp_rollout_queue,
                 async_op=True,
