@@ -412,6 +412,8 @@ class MathPipelineRunner:
         inference: MegatronInference,
         critic=None,
         reward=None,
+        resharding_strategies=None,
+        frist_resharding_state=-1
     ):
         self.cfg = cfg
 
@@ -438,9 +440,6 @@ class MathPipelineRunner:
         self._set_max_steps()
 
     def init_workers(self):
-        rollout_init_future = self.rollout.init_worker()
-        inference_init_future = self.inference.init_worker()
-
         if self.cfg.runner.resume_dir is None:
             logging.info("Training from scratch")
             if (
@@ -454,8 +453,8 @@ class MathPipelineRunner:
                     self.cfg.actor.megatron.ckpt_convertor,
                 )
             self.actor.init_worker().wait()
-            rollout_init_future.wait()
-            inference_init_future.wait()
+            self.rollout.init_worker().wait()
+            self.inference.init_worker().wait()
 
             self._sync_weights()
             return
@@ -471,6 +470,9 @@ class MathPipelineRunner:
         # load actor
         self.actor.init_worker().wait()
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
+
+        rollout_init_future = self.rollout.init_worker()
+        inference_init_future = self.inference.init_worker()
         rollout_init_future.wait()
         inference_init_future.wait()
 

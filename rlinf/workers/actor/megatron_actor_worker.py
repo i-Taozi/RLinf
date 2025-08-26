@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import copy
-from typing import List
+from typing import Callable, Dict, List, Optional
 
 import torch
 import torch.distributed
@@ -21,6 +21,7 @@ from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.utils import divide
+from megatron.training.global_vars import get_args
 from megatron.training.training import unwrap_model
 from megatron.training.utils import average_losses_across_data_parallel_group
 from omegaconf import DictConfig
@@ -78,6 +79,12 @@ from rlinf.workers.rollout.utils import (
     HybridRankMapper,
 )
 
+try:
+    from params_resharding import resharding_init
+    HAVE_RESHARDING = True
+except ImportError:
+    print("can't find params_resharding, resharding is not supported", flush=True)
+    HAVE_RESHARDING = False
 
 class MegatronActor(MegatronModelManager, Worker):
     """The class for running the actor training using Megatron."""
@@ -152,7 +159,7 @@ class MegatronActor(MegatronModelManager, Worker):
             self._data_channel = self.connect_channel(
                 channel_name=role_cfg.channel.name
             )
-            self._queue_name = f"{role_cfg.channel.queue_name}_{parallel_state.get_data_parallel_rank()}"
+            self._queue_name = f"{role_cfg.channel.queue_name}"
             self._data_channel.create_queue(
                 self._queue_name, maxsize=role_cfg.channel.queue_size
             )
@@ -169,6 +176,21 @@ class MegatronActor(MegatronModelManager, Worker):
         self.average_respone_len = self.response_len
 
         self._init_profiler()
+
+        # TODO(Chunyang && Junhao) :: megatron + scheduler
+        try:
+            self.use_schedule = self.cfg.cluster.placement.use_schedule
+        except Exception as e:
+            self.use_schedule = False
+        if self.use_schedule:
+            assert HAVE_RESHARDING, "params_resharding is required for scheduler"
+            self.schedule_channel = self.connect_channel(self.cfg.cluster.placement.schedule_channel_name)
+            # warmup
+            self.schedule_channel.put(None, async_op=False)
+            self.schedule_channel.get(async_op=False)
+
+            self.schedule_req_queue_name = self.cfg.cluster.placement.schedule_req_queue_name
+            self.schedule_resp_trainer_queue = self.cfg.cluster.placement.schedule_resp_trainer_queue_name
 
     def _init_profiler(self):
         def _validate_schedule_info():
@@ -711,32 +733,245 @@ class MegatronActor(MegatronModelManager, Worker):
 
     def run_training_pipeline(self):
         set_train(self)
-        configure_batch_sizes(
-            rank=torch.distributed.get_rank(),
-            mbs=self.cfg.actor.micro_batch_size,
-            gbs=self.cfg.actor.global_batch_size,
-            dp=parallel_state.get_data_parallel_world_size(),
-        )
-        self.log_info(
-            f"run_training_pipeline: mbs={self.cfg.actor.micro_batch_size}, gbs={self.cfg.actor.global_batch_size}, dp={parallel_state.get_data_parallel_world_size()}, n_mbs={get_num_microbatches()}"
-        )
+        self.calc_num_microbatches()
 
         num_opt_step = self.cfg.algorithm.n_minibatches
         self._batch_buffer_for_metrics.clear()
 
         training_metrics_list = []
         for _ in range(num_opt_step):
+            if not self.check_resharding(is_end=False):
+                continue
             batch = self.batch_iterator
             training_metrics = self.training_step(batch, pipeline_func=True)
             training_metrics_list.append(training_metrics)
 
+        self.check_resharding(is_end=True)
+
+        rollout_metrics_valid_dp_group = self.process_rollout_metrics_with_elastic()
+        if rollout_metrics_valid_dp_group is None:
+            return
         rollout_metrics = RolloutResult.to_metrics(self._batch_buffer_for_metrics)
         rollout_metrics = compute_rollout_metrics_pipeline(
-            rollout_metrics, self.cfg.data.max_prompt_length, self.response_len
+            rollout_metrics, self.cfg.data.max_prompt_length, self.response_len, rollout_metrics_valid_dp_group
         )
         self.average_respone_len = rollout_metrics["response_length"]
 
         return rollout_metrics, training_metrics_list
+
+    # Elastic-Training
+    def process_rollout_metrics_with_elastic(self):
+        if not self.use_schedule:
+            return parallel_state.get_data_parallel_group()
+
+        max_data_parallel_group = parallel_state.get_data_parallel_group_elastic_max()
+        max_data_parallel_ranks = torch.distributed.get_process_group_ranks(max_data_parallel_group)
+
+        rollout_metrics_dp_ranks_states = torch.tensor([(dp_rank == self._rank and len(self._batch_buffer_for_metrics) > 0) for dp_rank in max_data_parallel_ranks]).cuda()
+        torch.distributed.all_reduce(rollout_metrics_dp_ranks_states, torch.distributed.ReduceOp.MAX, group=max_data_parallel_group)
+
+        rollout_metrics_dp_ranks_states = rollout_metrics_dp_ranks_states.tolist()
+        rollout_metrics_valid_dp_ranks = [rank for rank, state in zip(max_data_parallel_ranks, rollout_metrics_dp_ranks_states) if state]
+
+        if len(self._batch_buffer_for_metrics) > 0:
+            return parallel_state.get_group_by_ranks(rollout_metrics_valid_dp_ranks)
+        return None
+
+    def calc_num_microbatches(self):
+        if self.resharding_state != ReshardingState.RUN:
+            return
+        configure_batch_sizes(
+                rank=torch.distributed.get_rank(),
+                mbs=self.cfg.actor.micro_batch_size,
+                gbs=self.cfg.actor.global_batch_size,
+                dp=parallel_state.get_data_parallel_world_size(),
+            )
+        self.log_info(f"run_training_pipeline: mbs={self.cfg.actor.micro_batch_size}, gbs={self.cfg.actor.global_batch_size}, dp={parallel_state.get_data_parallel_world_size()} {get_num_microbatches()=}")
+
+    def init_trainer_resharding(self, resharding_strategies, frist_resharding_state : int):
+        """Init resharding func.
+
+        Args:
+            trainer_parallel_strategies (List[Dict[str, int]]): Megatron's training parallel strategy, the first strategy should be the same as cfg.
+            frist_resharding_state (int) : The first resharding state to apply
+        """
+        assert HAVE_RESHARDING, "params_resharding is not installed"
+
+        trainer_parallel_strategies = []
+        tag_to_state_id = {}
+        for k, v in list(resharding_strategies.items())[::-1]:
+            tag_to_state_id[k] = len(tag_to_state_id)
+            trainer_parallel_strategies.append({
+                "world_size" : v['trainer']['ws'],
+                "tensor_model_parallel_size":v['trainer']['tp'],
+                "pipeline_model_parallel_size":v['trainer']['pp'],
+                "context_parallel_size":v['trainer']['cp'],
+                "data_parallel_size":v['trainer']['dp'],
+            })
+
+        self.resharding_strategies = resharding_strategies
+        self.trainer_parallel_strategies = trainer_parallel_strategies
+        self.tag_to_state_id = tag_to_state_id
+
+        args = get_args()
+        args.rank = torch.distributed.get_rank()
+        args.world_size = torch.distributed.get_world_size()
+        args.data_parallel_size = args.world_size // (args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size)
+        args.load = None
+
+
+        self.trainer_resharding_func : Callable = resharding_init(
+            model = self.model,
+            optimizer = self.optimizer,
+            opt_param_scheduler = self.lr_scheduler,
+            trainer_parallel_strategies = trainer_parallel_strategies,
+            offload_frist_strategy = False,
+            model_provider = self.model_provider_func,
+        )
+
+        self.resharding_state : ReshardingState = ReshardingState.RUN
+        if frist_resharding_state != 0:
+            self.apply_parallel_strategy(frist_resharding_state)
+
+    def apply_parallel_strategy(self, resharding_state_id : int = -1, new_parallel_strategy : Optional[Dict[str, int]] = None) -> bool:
+        """Apply specified training parallel strategy
+
+        Args:
+            is_survival_node (bool): The last return value of the current function, indicating whether cur_rank is currently training
+            resharding_state_id (int): Index of self.trainer_parallel_strategies, apply self.trainer_parallel_strategies[resharding_state_id] as new parallel strategy
+            new_parallel_strategy (Dict[str, int]): Register and apply a new parallel strategy
+
+        Return:
+            is_survival_node (bool) : Return True if this rank is new/survival node
+        """
+
+        if resharding_state_id == -1:
+            assert new_parallel_strategy is not None
+            self.trainer_parallel_strategies.append(new_parallel_strategy)
+        else:
+            assert new_parallel_strategy is None
+
+        self._logger.info(f"[ElasticMegatron-Info] rank={torch.distributed.get_rank()} start resharing with state_id = {resharding_state_id}")
+        training_states, new_state_id = self.trainer_resharding_func(new_state_id=resharding_state_id, new_parallel_strategy=new_parallel_strategy)
+
+        self.resharding_state_id = new_state_id
+        if training_states is not None:
+            self.model = training_states.model
+            self.optimizer = training_states.optimizer
+            self.lr_scheduler = training_states.opt_param_scheduler
+            self.resharding_state = ReshardingState.RUN
+        else:
+            self.resharding_state = ReshardingState.CONTINUE
+
+    # Elastic-Training TODO(Chunyang)
+    def broadcast_obj(self, obj):
+        # device = torch.device("cpu")
+        device = torch.cuda.current_device()
+        if self._rank == 0:
+            torch.distributed.broadcast_object_list([obj], src=0, device=device)
+        else:
+            obj_list = [None]
+            torch.distributed.broadcast_object_list(obj_list, src=0, device=device)
+            obj = obj_list[0]
+        return obj
+
+    def refresh_resharding_state(self, is_end: bool):
+        parallel_state.barrier_with_gloo()
+        resharding_resp = None
+        if self._rank == 0:
+            # Get batch_iterator data size information
+            current_batch_size = 0
+            micro_batch_counter = 0
+            if hasattr(self, 'batch_iterator') and self.batch_iterator is not None:
+                current_batch_size = self.batch_iterator.get_current_batch_size()
+                micro_batch_counter = self.batch_iterator.get_micro_batch_counter()
+
+            if not is_end:
+                self.schedule_channel.put(
+                    TrainerReq(
+                        type='req_loop',
+                        current_batch_size=current_batch_size,
+                        micro_batch_counter=micro_batch_counter
+                    ).serialize(),
+                    queue_name=self.schedule_req_queue_name,
+                    async_op=False,
+                )
+                self.log_info(f"Sent req_loop with batch info: current_batch_size={current_batch_size}, micro_batch_counter={micro_batch_counter}")
+            else:
+                self.schedule_channel.put(
+                    TrainerReq(
+                        type='req_end',
+                        current_batch_size=current_batch_size,
+                        micro_batch_counter=micro_batch_counter
+                    ).serialize(),
+                    queue_name=self.schedule_req_queue_name,
+                    async_op=False,
+                )
+                self.log_info(f"Sent req_end with batch info: current_batch_size={current_batch_size}, micro_batch_counter={micro_batch_counter}")
+            resharding_resp = self.schedule_channel.get(
+                queue_name=self.schedule_resp_trainer_queue,
+                async_op=False,
+            )
+            self.log_info(f"refresh_resharding_state: {resharding_resp}")
+        resharding_resp = TrainerResp.deserialize(self.broadcast_obj(resharding_resp))
+        # print(f"zcy_dbg [{torch.distributed.get_rank()}]: GRPOTask get resharding_resp: {resharding_resp}", flush=True)
+        if not resharding_resp.need_reshard:
+            assert self.resharding_state in (ReshardingState.RUN, ReshardingState.CONTINUE), f"Invalid resharding state: {self.resharding_state}"
+            return None
+        else:
+            self.resharding_state = ReshardingState.RESHARDING
+        return resharding_resp
+
+    def check_resharding(self, is_end: bool):
+        if not self.use_schedule:
+            return True
+        resharding_resp = self.refresh_resharding_state(is_end)
+        assert self.resharding_state in (ReshardingState.RESHARDING, ReshardingState.RUN, ReshardingState.CONTINUE), f"Invalid resharding state: {self.esharding_state}"
+
+        if self.resharding_state == ReshardingState.RESHARDING:
+            self.log_info(f"rank [{self._rank}]: resharding start")
+            self.apply_parallel_strategy(self.tag_to_state_id[resharding_resp.tag])
+            if self._rank == 0:
+                if not is_end:
+                    # Get batch_iterator data size information
+                    current_batch_size = 0
+                    micro_batch_counter = 0
+                    if hasattr(self, 'batch_iterator') and self.batch_iterator is not None:
+                        current_batch_size = self.batch_iterator.get_current_batch_size()
+                        micro_batch_counter = self.batch_iterator.get_micro_batch_counter()
+
+                    self.schedule_channel.put(
+                        TrainerReq(
+                            type='resharded',
+                            input_qsize=self._data_channel.qsize(queue_name=self._queue_name),
+                            current_batch_size=current_batch_size,
+                            micro_batch_counter=micro_batch_counter
+                        ).serialize(),
+                        queue_name=self.schedule_req_queue_name,
+                        async_op=False,
+                    )
+                    self.log_info(f"Sent resharded with batch info: current_batch_size={current_batch_size}, micro_batch_counter={micro_batch_counter}, input_qsize={self._data_channel.qsize(queue_name=self._queue_name)}")
+            self.calc_num_microbatches()
+            report_device_info(f"zcy_dbg: rank [{self._rank}]: Actor after resharding:")
+
+        if is_end and self._rank == 0:
+            # Get batch_iterator data size information
+            current_batch_size = 0
+            micro_batch_counter = 0
+            if hasattr(self, 'batch_iterator') and self.batch_iterator is not None:
+                current_batch_size = self.batch_iterator.get_current_batch_size()
+                micro_batch_counter = self.batch_iterator.get_micro_batch_counter()
+
+            self.schedule_channel.put(
+                TrainerReq(
+                    type='loop_finish',
+                    current_batch_size=current_batch_size,
+                    micro_batch_counter=micro_batch_counter
+                ).serialize(),
+                queue_name=self.schedule_req_queue_name,
+                async_op=False,
+            )
+        return self.resharding_state == ReshardingState.RUN
 
     # Inference
     @torch.no_grad()

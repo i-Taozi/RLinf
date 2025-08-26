@@ -407,42 +407,40 @@ class MegatronModelManager:
             output = output[..., 0]
         return output
 
-    def offload_model_weights_and_grad(self, offload_grad=True):
+    def offload_model_weights_and_grad(self, offload_grad=True, offload_weight=True, save_cpu_data=True):
         for model_idx, model_chunk in enumerate(self.model):
             if isinstance(model_chunk, DDP):
                 for buffer_idx, buffer in enumerate(model_chunk.buffers):
-                    if buffer.param_data.untyped_storage().size() > 0:
-                        param_size = buffer.param_data.untyped_storage().size()
-
-                        buffer.param_data.cpu_data = (
-                            buffer.param_data.data.cpu().pin_memory()
-                        )
-                        buffer.param_data_size = param_size
-
+                    buffer.param_data_size = buffer.param_data.untyped_storage().size()
+                    if offload_weight and buffer.param_data_size > 0:
+                        if save_cpu_data:
+                            buffer.param_data.cpu_data = (
+                                buffer.param_data.data.cpu().pin_memory()
+                            )
+                            assert (buffer.param_data_size == buffer.param_data.cpu_data.untyped_storage().size())
                         buffer.param_data.untyped_storage().resize_(0)
 
-                        assert (
-                            buffer.param_data_size
-                            == buffer.param_data.cpu_data.untyped_storage().size()
-                        )
-
-                    if offload_grad and buffer.grad_data.untyped_storage().size() > 0:
-                        grad_size = buffer.grad_data.untyped_storage().size()
-                        buffer.grad_data_size = grad_size
+                    buffer.grad_data_size = buffer.grad_data.untyped_storage().size()
+                    if offload_grad and buffer.grad_data_size > 0:
                         buffer.grad_data.untyped_storage().resize_(0)
 
             else:
                 for param_name, param in model_chunk.named_parameters():
-                    if param.data is not None:
-                        param.data = param.data.to("cpu", non_blocking=True)
+                    if offload_weight and param.data is not None:
+                        if save_cpu_data:
+                            param.data = param.data.to("cpu", non_blocking=True)
+                        else:
+                            param.data_size = param.data.storage().size()
+                            param.data.storage().resize_(0)
 
-                    if param.grad is not None:
-                        param.grad = param.grad.to("cpu", non_blocking=True)
+                    if offload_grad and param.grad is not None:
+                        param.grad_size = param.grad.storage().size()
+                        param.grad.storage().resize_(0)
 
         # clear memory
         clear_memory()
 
-    def onload_model_weights_and_grad(self, load_grad=True):
+    def onload_model_weights_and_grad(self, load_grad=True, load_weight=True, load_cpu_data=True):
         gc.collect()
         torch.cuda.empty_cache()
         for model_chunk in self.model:
@@ -455,20 +453,25 @@ class MegatronModelManager:
                         )
                         buffer.grad_data.zero_()
 
-                    if buffer.param_data.untyped_storage().size() == 0:
+                    if load_weight and buffer.param_data.untyped_storage().size() == 0:
                         buffer.param_data.untyped_storage().resize_(
                             buffer.param_data_size
                         )
                         # copy data from cpu to cuda
-                        buffer.param_data.copy_(
-                            buffer.param_data.cpu_data, non_blocking=True
-                        )
+                        if load_cpu_data:
+                            buffer.param_data.copy_(
+                                buffer.param_data.cpu_data, non_blocking=True
+                            )
             else:
                 device_id = torch.cuda.current_device()
                 for _, param in model_chunk.named_parameters():
-                    param.data = param.data.to(device_id, non_blocking=True)
-                    if param.grad is not None:
-                        param.grad = param.grad.to(device_id, non_blocking=True)
+                    if load_weight:
+                        if load_cpu_data:
+                            param.data = param.data.to(device_id, non_blocking=True)
+                        else:
+                            param.data.storage().resize_(param.data_size)
+                    if load_grad and param.grad is not None:
+                        param.grad.storage().resize_(param.grad_size)
         clear_memory()
 
     def offload_megatron_copy_params(self, optimizers):

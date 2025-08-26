@@ -181,14 +181,11 @@ class DataServer(ChannelWorker):
         )
 
     async def create_queue_for_actor_dp(self):
-        queue_names: List[str] = []
-        for i in range(self._actor_dp_size):
-            queue_name = f"{self._actor_queue_name_prefix}_{i}"
-            self.create_queue(queue_name, maxsize=self._actor_queue_size)
-            queue_names.append(queue_name)
+        queue_name = f"{self._actor_queue_name_prefix}"
+        self.create_queue(queue_name, maxsize=self._actor_queue_size)
         await self.round_robin_template(
             queue_name_input=self._infer_queue_name_prefix,
-            queue_names_output=queue_names,
+            queue_names_output=[queue_name],
             iter_len=self._actor_iter_len,
         )
 

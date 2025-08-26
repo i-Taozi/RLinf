@@ -87,6 +87,10 @@ class MegatronInference(MegatronActor):
             // self.component_placement.inference_dp_size
         )
 
+        # TODO(Chunyang && Junhao) :: megatron + scheduler
+        if self.use_schedule:
+            self.schedule_req_queue_name = self.cfg.cluster.placement.schedule_req_queue_name
+
     def init_worker(self):
         self.setup_model_and_optimizer()
         self.optimizer, self.lr_scheduler = None, None
@@ -252,3 +256,12 @@ class MegatronInference(MegatronActor):
                     f"Processed {self._iteration // self._num_rollout_results_per_step} * {self._num_rollout_results_per_step} batches in inference pipeline. Sync weight from actor."
                 )
                 self._clear_timers()
+
+        # TODO(Chunyang && Junhao) :: megatron + scheduler
+        if self.use_schedule:
+            self.model_manager.offload_model_weights_and_grad(offload_grad=True, save_cpu_data=False)
+            self.schedule_channel.put(
+                InferenceReq().serialize(),
+                queue_name=self.schedule_req_queue_name,
+                async_op=False,
+            )

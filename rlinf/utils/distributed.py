@@ -130,6 +130,7 @@ def compute_rollout_metrics_pipeline(
     max_prompt_len: int,
     response_len: int,
     use_critic: bool = False,
+    data_parallel_group = None,
 ):
     """
     input:
@@ -144,38 +145,29 @@ def compute_rollout_metrics_pipeline(
                 "advantages": adv,
             }
     """
+    if data_parallel_group is None:
+        data_parallel_group =  parallel_state.get_data_parallel_group()
     prompt_lengths = metrics["prompt_lengths"].cuda()
     response_lengths = metrics["response_lengths"].cuda()
     rewards = metrics["rewards"].cuda()
     is_end = metrics["is_end"].cuda()
+    adv = metrics["advantages"].cuda()
+
+    sum_plen = prompt_lengths.sum().detach().item()
+    sum_rlen = response_lengths.sum().detach().item()
+    sum_rewards = rewards.sum().detach().item()
+    sum_end = is_end.sum().detach().item()
+    sum_adv = adv.sum().detach().item()
+    num_seq = prompt_lengths.numel()
+    reduce_metrics_1 = torch.as_tensor(
+        [sum_plen, sum_rlen, sum_rewards, sum_end, sum_adv, num_seq], device=torch.cuda.current_device(), dtype=torch.float32
+    )
 
     torch.distributed.all_reduce(
-        prompt_lengths,
-        torch.distributed.ReduceOp.AVG,
-        group=parallel_state.get_data_parallel_group(),
-    )
-    torch.distributed.all_reduce(
-        response_lengths,
-        torch.distributed.ReduceOp.AVG,
-        group=parallel_state.get_data_parallel_group(),
-    )
-    torch.distributed.all_reduce(
-        rewards,
-        torch.distributed.ReduceOp.AVG,
-        group=parallel_state.get_data_parallel_group(),
-    )
-    torch.distributed.all_reduce(
-        is_end,
-        torch.distributed.ReduceOp.AVG,
-        group=parallel_state.get_data_parallel_group(),
+        reduce_metrics_1, torch.distributed.ReduceOp.SUM, group=data_parallel_group
     )
 
-    adv_mean = metrics["advantages"].mean().cuda()
-    torch.distributed.all_reduce(
-        adv_mean,
-        torch.distributed.ReduceOp.AVG,
-        group=parallel_state.get_data_parallel_group(),
-    )
+    sum_plen, sum_rlen, sum_rewards, sum_end, sum_adv, num_seq = reduce_metrics_1.tolist()
 
     adv_max = metrics["advantages"].max().detach().item()
     adv_min = metrics["advantages"].min().detach().item()
@@ -183,26 +175,24 @@ def compute_rollout_metrics_pipeline(
         [-adv_min, adv_max], device=torch.cuda.current_device(), dtype=torch.float32
     )
     torch.distributed.all_reduce(
-        reduce_tensor,
-        torch.distributed.ReduceOp.MAX,
-        group=parallel_state.get_data_parallel_group(),
+        reduce_tensor, torch.distributed.ReduceOp.MAX, group=data_parallel_group
     )
     adv_min, adv_max = reduce_tensor.tolist()
 
     rollout_metrics = {
-        "batch_size_per_dp": metrics["batch_size_per_dp"].item(),
-        "prompt_length": prompt_lengths.float().mean().item(),
-        "response_length": response_lengths.float().mean().item(),
-        "total_length": (response_lengths + prompt_lengths).float().mean().item(),
-        "rewards": rewards.float().mean().item(),
-        "fraction_of_samples_properly_ended": is_end.float().mean().item(),
-        "advantages_mean": adv_mean.item(),
+        "table": {},
+        "total_num_sequence": num_seq,
+        "prompt_length": sum_plen / num_seq,
+        "response_length": sum_rlen / num_seq,
+        "total_length": (sum_plen + sum_rlen) / num_seq,
+        "rewards": sum_rewards / num_seq,
+        "fraction_of_samples_properly_ended": sum_end / num_seq,
+        "advantages_mean": sum_adv / num_seq,
         "advantages_max": adv_max,
         "advantages_min": -adv_min,
     }
 
     return rollout_metrics
-
 
 class RolloutDataBalance(UserDict):
     def __init__(
