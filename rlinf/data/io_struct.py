@@ -79,12 +79,17 @@ class CompletionInfo:
         self.input_ids: Dict[int, List[int]] = {}  # hash -> input token IDs
         self.complete_num: Dict[int, int] = {}  # hash -> completion count
         self.results: Dict[int, List[Dict]] = {}  # hash -> list of results
+        self.input_ids_map: Dict[int, List[Dict]] = {}  # unique_id -> input_ids
+        self.answers: Dict[int, List[str]] = {}  # unique_id -> answer
+        self.abort_results: Dict[int, List[Dict]] = {}  # unique_id -> list of abort results
 
         self.num_requests: int = 0
         self.num_completed: int = 0
         self._num_returned: int = 0  # Number of results returned
 
         self.n_result_each_request: int = 0
+
+        self.unique_id_inc = 0
 
         self.logger = logger
 
@@ -99,6 +104,9 @@ class CompletionInfo:
         self.num_requests = 0
         self.num_completed = 0
         self._num_returned = 0
+        self.unique_id_inc = 0
+        self.unique_id_map: Dict[int, int] = {}  # unique_id -> hash
+        self.answers.clear()
 
     def add_request(self, req: RolloutRequest):
         """Add a new request to the completion info."""
@@ -125,20 +133,23 @@ class CompletionInfo:
         self.add_request(req)
 
     def is_empty(self) -> bool:
-        return len(self.complete_num) == 0 and len(self.results) == 0
+        return len(self.results) == 0
 
-    def record_result(self, token_ids: List[int], result: Dict) -> int:
-        hash_id = self.hash(token_ids)
+    def record_result(self, unique_id: int, result: Dict) -> int:
+        # only in ["abort", "stop", "length"]
+        finished_reason = result["meta_info"]["finish_reason"]["type"]
+        self.complete_num[unique_id] += 1
+        if finished_reason == "abort":
+            self.abort_results[unique_id].append(result)
+        else:
+            self.results[unique_id].append(result)
 
-        self.complete_num[hash_id] += 1
-        self.results[hash_id].append(result)
+            if len(self.results[unique_id]) == self.n_result_each_request:
+                self.num_completed += 1
+                if self.logger is not None:
+                    self.logger.info(f"Completed all generations for unique_id: {unique_id}")
 
-        if self.complete_num[hash_id] == self.n_result_each_request:
-            self.num_completed += 1
-            if self.logger is not None:
-                self.logger.debug(f"Completed all rollouts for hash: {hash_id}")
-
-        return self.complete_num[hash_id]
+        return len(self.results[unique_id])
 
     def is_completed(self, hash_id: int) -> bool:
         return self.complete_num[hash_id] == self.n_result_each_request
@@ -152,6 +163,24 @@ class CompletionInfo:
         value = self.results.pop(hash_id)
         return value
 
+    def pop_results(self, unique_id: int):
+        """Get the results for the given token IDs."""
+        assert unique_id in self.input_ids_map, "Hash ID not found in input_ids_map"
+        assert unique_id in self.answers, "Hash ID not found in answers"
+        assert unique_id in self.results, "Hash ID not found in results"
+        assert unique_id in self.abort_results, "Hash ID not found in abort_results"
+        assert len(self.results[unique_id]) == self.n_result_each_request, (
+            "Not all results for this hash ID are completed"
+        )
+        assert len(self.abort_results[unique_id]) == 0, (
+            "Any results for this hash ID are aborted"
+        )
+        input_ids = self.input_ids_map.pop(unique_id)
+        answer = self.answers.pop(unique_id)
+        self.abort_results.pop(unique_id)
+        results = self.results.pop(unique_id)
+        return input_ids, answer, results
+
     def record_returned(self):
         """Record that a result has been returned."""
         self._num_returned += 1
@@ -164,13 +193,22 @@ class CompletionInfo:
         """Check if all results have been returned."""
         return self._num_returned == self.num_requests
 
+    def add_unique_id(self, input_ids, answer) -> int:
+        unique_id = self.unique_id_inc
+        self.unique_id_inc += 1
+
+        self.input_ids_map[unique_id] = input_ids
+        self.answers[unique_id] = answer
+        self.results[unique_id] = []
+        self.abort_results[unique_id] = []
+        self.complete_num[unique_id] = 0
+        self.num_requests += 1
+        return unique_id
+
+
 
 @dataclass(kw_only=True)
 class RolloutResult:
-    """
-    Rollout Result
-    """
-
     num_sequence: int
     prompt_lengths: List[int]
     prompt_ids: List[List[int]]
@@ -318,35 +356,15 @@ class RolloutResult:
             pad_token (int): Token used for padding, e.g., `tokenizer.pad_token_id`.
 
         Returns:
-            Dict[str, torch.Tensor]: A dictionary with keys:
+            Dict[str,torch.Tensor]: A dictionary containing the following keys:
 
-            input_ids (torch.Tensor):
-                Concatenated prompt and response token IDs,
-                shape ``[batch_size, training_seq_length]``.
-
-            attention_mask (torch.Tensor):
-                Attention mask for the input sequence,
-                shape ``[batch_size, training_seq_length]``.
-
-            is_end (torch.Tensor):
-                Boolean tensor indicating whether the sequence ends,
-                shape ``[batch_size]``.
-
-            position_ids (torch.Tensor):
-                Position IDs for the input sequence,
-                shape ``[batch_size, training_seq_length]``.
-
-            prompt_lengths (torch.Tensor):
-                Lengths of the prompt sequences,
-                shape ``[batch_size]``.
-
-            response_lengths (torch.Tensor):
-                Lengths of the response sequences,
-                shape ``[batch_size]``.
-
-            advantages (torch.Tensor), optional:
-                Advantage values for the responses,
-                shape ``[batch_size, training_seq_length - data_seq_length]``.
+        - "input_ids" (torch.Tensor): Concatenated prompt and response token IDs, with shape [batch_size, training_seq_length].
+        - "attention_mask" (torch.Tensor): Attention mask for the input sequence, with shape [batch_size, training_seq_length].
+        - "is_end" (torch.Tensor): Boolean tensor indicating whether the sequence ends with shape [batch_size, ].
+        - "position_ids" (torch.Tensor): Position IDs for the input sequence, with shape [batch_size, training_seq_length].
+        - "prompt_lengths" (torch.Tensor): Lengths of the prompt sequences with shape [batch_size, ].
+        - "response_lengths" (torch.Tensor): Lengths of the response sequences with shape [batch_size, ].
+        - "advantages" (torch.Tensor): Advantage values for the responses,with shape [batch_size, training_seq_length - data_seq_length] .
         """
 
         # len = training_seq_length: input_ids, attention_mask, position_ids
