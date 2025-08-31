@@ -160,7 +160,7 @@ class SchedulerTask:
                     start_gpu_id += allocation.get_component(component.name).world_size
             return OmegaConf.to_yaml(new_cfg)
 
-        raise NotImplementedError("Mixed mode is not supported")
+        raise NotImplementedError("hybrid mode is not supported")
 
     def time_division_multiplexing(self) -> List[Dict[str, Workflow]]:
         partitions: List[Dict[str, Workflow]] = get_workflow_partition(self.workflow)
@@ -249,7 +249,7 @@ def main(cfg):
     res = scheduler_task.run()
 
     print("=" * 50)
-    print("Best palcement for this task is:\n")
+    print("Best placement for this task is:\n")
     print(res)
 
 
