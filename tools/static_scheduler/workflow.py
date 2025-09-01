@@ -1,3 +1,17 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import itertools
 import math
 from collections import defaultdict, deque
@@ -95,7 +109,6 @@ class Workflow:
     def compress_sccs(self) -> "Workflow":
         """Compress strongly connected components (SCCs) into single nodes to build a directed acyclic graph (DAG)"""
 
-        # Create mapping from node to SCC index
         node_to_scc = {}
         for scc_idx, scc in enumerate(self.sccs):
             for node in scc:
@@ -106,11 +119,9 @@ class Workflow:
 
         # Create compressed node for each SCC
         for scc_idx, scc in enumerate(self.sccs):
-            # If SCC has only one node, use the original node directly
             if len(scc) == 1:
                 compressed_node = scc[0]
             else:
-                # If SCC has multiple nodes, create SccComponentNode
                 compressed_node = SccComponentNode(scc)
 
             compressed_workflow[compressed_node] = []
@@ -123,14 +134,11 @@ class Workflow:
                         target_compressed_node = None
                         for existing_node in compressed_workflow.keys():
                             if existing_node in compressed_workflow:
-                                # Check if it's the corresponding SCC
                                 if len(self.sccs[neighbor_scc]) == 1:
-                                    # Single node SCC
                                     if existing_node == self.sccs[neighbor_scc][0]:
                                         target_compressed_node = existing_node
                                         break
                                 else:
-                                    # Multiple node SCC
                                     if (
                                         isinstance(existing_node, SccComponentNode)
                                         and existing_node.components
@@ -151,7 +159,7 @@ class Workflow:
         return Workflow(compressed_workflow)
 
     def topological_sort(self) -> List[Node]:
-        """Perform topological sort on the graph"""
+        """Perform topological sort on the workflow(graph)"""
         if self.topological_order is not None:
             return self.topological_order
 
@@ -194,7 +202,6 @@ class WorkflowPartitioner:
         for num_partitions in range(1, len(self.workflow.sccs) + 1):
             # Generate all possible cut point combinations
             if num_partitions == 1:
-                # All SCCs in one subgraph
                 subgraph_nodes = self._extract_nodes_from_compressed_workflow()
                 subgraph_workflow = self._create_subgraph_workflow(subgraph_nodes)
                 partition_graph = {"SUBGRAPH_0": subgraph_workflow}
@@ -207,9 +214,7 @@ class WorkflowPartitioner:
                     partition_graph = {}
                     start_idx = 0
                     subgraph_id = 0
-
                     for cut_point in cut_points:
-                        # Collect SCCs from start_idx to cut_point
                         sccs_in_partition = []
                         for i in range(start_idx, cut_point + 1):
                             compressed_node = self.workflow.topological_order[i]
@@ -266,7 +271,6 @@ class WorkflowPartitioner:
         """
         subgraph_dict = {}
         for node in nodes:
-            # Get neighbors of this node, only keep those in the subgraph
             neighbors = []
             for neighbor in self.workflow.workflow.get(node, []):
                 if neighbor in nodes:
@@ -397,5 +401,5 @@ def get_workflow_cost(
 
 
 def get_workflow_partition(workflow: Workflow) -> List[Dict[str, Workflow]]:
-    """Get graph partitioning ways"""
+    """Get workflow partitions"""
     return WorkflowPartitioner(workflow).partition()

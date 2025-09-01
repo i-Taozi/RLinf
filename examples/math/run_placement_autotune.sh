@@ -13,4 +13,4 @@ else
     CONFIG_NAME=$1
 fi
 
-python3 ${REPO_PATH}/tools/static_scheduler/scheduler_task.py --config-path ${CONFIG_PATH}/config/  --config-name $CONFIG_NAME
+python ${REPO_PATH}/tools/static_scheduler/scheduler_task.py --config-path ${CONFIG_PATH}/config/  --config-name $CONFIG_NAME
