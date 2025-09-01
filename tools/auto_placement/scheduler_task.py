@@ -232,8 +232,7 @@ class SchedulerTask:
         return min_cost_allocation, min_cost
 
 
-def get_profile_data(cfg):
-    # TODO :: Hardcode for profile_data
+def get_profile_data(cfg, trainer_cost=None, inference_cost=None, rollout_cost=None):
     total_gpus = cfg.cluster.num_gpus_per_node * cfg.cluster.num_nodes
     shared_trainer_instance_num = total_gpus // (
         cfg.actor.model.tensor_model_parallel_size
@@ -245,9 +244,9 @@ def get_profile_data(cfg):
     )
 
     profile_data = {
-        "trainer": (shared_trainer_instance_num, 95.7),
-        "inference": (shared_inference_instance_num, 30.8),
-        "rollout": (shared_rollout_instance_num, 59.9),
+        "trainer": (shared_trainer_instance_num, trainer_cost),
+        "inference": (shared_inference_instance_num, inference_cost),
+        "rollout": (shared_rollout_instance_num, rollout_cost),
     }
 
     return profile_data
@@ -257,7 +256,14 @@ def get_profile_data(cfg):
 def main(cfg):
     cfg = validate_cfg(cfg)
 
-    profile_data = get_profile_data(cfg)
+    trainer_cost = getattr(cfg.profile_data, 'trainer_cost', None)
+    inference_cost = getattr(cfg.profile_data, 'inference_cost', None)
+    rollout_cost = getattr(cfg.profile_data, 'rollout_cost', None)
+
+    if trainer_cost is None or inference_cost is None or rollout_cost is None:
+        raise ValueError("Profile data is not provided")
+    
+    profile_data = get_profile_data(cfg, trainer_cost, inference_cost, rollout_cost)
     scheduler_task = SchedulerTask(cfg)
     scheduler_task.register_profile_data(profile_data)
     res = scheduler_task.run()
