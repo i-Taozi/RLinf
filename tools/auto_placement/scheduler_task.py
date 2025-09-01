@@ -262,7 +262,7 @@ def main(cfg):
 
     if trainer_cost is None or inference_cost is None or rollout_cost is None:
         raise ValueError("Profile data is not provided")
-    
+
     profile_data = get_profile_data(cfg, trainer_cost, inference_cost, rollout_cost)
     scheduler_task = SchedulerTask(cfg)
     scheduler_task.register_profile_data(profile_data)
