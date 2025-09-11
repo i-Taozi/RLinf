@@ -90,6 +90,8 @@ class MegatronInference(MegatronActor):
         # TODO(Chunyang && Junhao) :: megatron + scheduler
         if self.use_schedule:
             self.schedule_req_queue_name = self.cfg.cluster.placement.schedule_req_queue_name
+        
+        self.offload_model = False
 
     def init_worker(self):
         self.setup_model_and_optimizer()
@@ -188,6 +190,10 @@ class MegatronInference(MegatronActor):
         return rollout_batch
 
     def sync_model_from_actor(self):
+        if self.offload_model:
+            self.onload_model_weights_and_grad(load_grad=False, load_weight=True, load_cpu_data=False)
+            
+            
         for rank in self._weight_dst_rank_in_inference:
             if self._rank == rank:
                 state_dict = self.recv(
@@ -228,6 +234,7 @@ class MegatronInference(MegatronActor):
 
         This is used for disaggregated mode where the model is not trained in the same process as the inference.
         """
+        
         for _ in range(self._num_rollout_results_per_step):
             with self._timer("inference_iter"):
                 with self._timer("recv_rollout_results"):
@@ -265,3 +272,14 @@ class MegatronInference(MegatronActor):
                 queue_name=self.schedule_req_queue_name,
                 async_op=False,
             )
+        
+        self.offload_model_weights_and_grad(offload_grad=False, offload_weight=True, save_cpu_data=False)
+        self.offload_model = True
+        
+        if self.use_auto_scheduler and self._rank == 0:
+            self.log_info(f'[dev-hjh] inference send ready_offload : queue_name={self.scheduler_response_queue}')
+            self.schedule_channel.put(
+                None, queue_name=self.scheduler_response_queue, async_op=True
+            ).wait()
+        
+        

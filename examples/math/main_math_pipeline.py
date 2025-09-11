@@ -29,14 +29,14 @@ from rlinf.data.tokenizers import hf_tokenizer
 from rlinf.runners.math_runner import MathPipelineRunner
 from rlinf.scheduler import ChannelWorker, Cluster, PackedPlacementStrategy
 from rlinf.scheduler.channel.channel_worker import WeightedItem
-from rlinf.utils.placement import ModelParallelComponentPlacement
+from rlinf.utils.placement import ModelParallelComponentPlacement, PlacementMode
 from rlinf.utils.timers import Timer
 from rlinf.utils.utils import output_redirector
 from rlinf.workers.actor.megatron_actor_worker import MegatronActor
 from rlinf.workers.inference.megatron_inference_worker import MegatronInference
 from rlinf.workers.rollout.sglang.sglang_worker import AsyncSGLangWorker
 from rlinf.workers.rollout.utils import split_sequence
-
+from rlinf.scheduler.dynamic_scheduler.scheduler_task import SchedulerTask
 """Script to start GRPO training"""
 mp.set_start_method("spawn", force=True)
 
@@ -266,6 +266,15 @@ def main(cfg) -> None:
     dataserver.create_queue_for_inference()
     dataserver.create_queue_for_actor_dp()
 
+    if component_placement._placement_mode == PlacementMode.AUTO:
+        scheduler_gpu_id = 1 if component_placement._cluster_num_gpus > 1 else 0
+        scheduler_placement_strategy = PackedPlacementStrategy(start_gpu_id=scheduler_gpu_id, end_gpu_id=scheduler_gpu_id)
+        scheduler_task = SchedulerTask.create_group(cfg, component_placement).launch(
+            cluster=cluster, name='SchedulerTask', placement_strategy=scheduler_placement_strategy
+        )
+    else:
+        scheduler_task = None
+
     rollout_placement_strategy = component_placement.get_strategy("rollout")
     rollout = AsyncSGLangWorker.create_group(cfg, component_placement).launch(
         cluster=cluster,
@@ -296,8 +305,9 @@ def main(cfg) -> None:
         actor=actor,
         rollout=rollout,
         inference=inference,
+        scheduler_task= scheduler_task
     )
-
+    
     runner.init_workers()
     runner.run()
 

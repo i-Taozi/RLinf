@@ -25,6 +25,7 @@ class PlacementMode(Enum):
     COLLOCATED = auto()
     DISAGGREGATED = auto()
     HYBRID = auto()
+    AUTO = auto()
 
 
 class ComponentPlacement:
@@ -187,7 +188,10 @@ class ModelParallelComponentPlacement(ComponentPlacement):
         )
         self._rollout_num_gpus = len(self._rollout_gpus)
 
-        if self._is_collocated():
+        if self._is_auto_scheduler():
+            self._placement_mode = PlacementMode.AUTO
+            logging.info("Running in auto-scheduler mode")
+        elif self._is_collocated():
             assert self.actor_tp_size >= self.rollout_tp_size, (
                 f"Actor TP size {self.actor_tp_size} must be greater or equal to Rollout TP size {self.rollout_tp_size}."
             )
@@ -211,6 +215,9 @@ class ModelParallelComponentPlacement(ComponentPlacement):
         assert self.rollout_tp_size <= self.rollout_world_size, (
             f"Rollout TP size {self.rollout_tp_size} must be less than or equal to Rollout world size {self.rollout_world_size}."
         )
+    
+    def _is_auto_scheduler(self):
+        return getattr(self._config.cluster, 'auto_scheduler', False)
 
     def _is_collocated(self):
         if self._actor_gpus == self._rollout_gpus:
@@ -261,8 +268,24 @@ class ModelParallelComponentPlacement(ComponentPlacement):
             self._placements["inference"] = PackedPlacementStrategy(
                 self._inference_gpus[0], self._inference_gpus[-1]
             )
+            
             self._placements["actor"] = PackedPlacementStrategy(
                 self._actor_gpus[0], self._actor_gpus[-1]
+            )
+        elif self._placement_mode == PlacementMode.AUTO:
+            num_gpus_per_rollout_dp = len(self._rollout_gpus) // self.rollout_dp_size
+            self._placements["rollout"] = PackedPlacementStrategy(
+                self._rollout_gpus[0],
+                self._rollout_gpus[-1],
+                num_gpus_per_process=num_gpus_per_rollout_dp,
+            )
+            self._placements["inference"] = PackedPlacementStrategy(
+                self._inference_gpus[0], self._inference_gpus[-1]
+            )
+            
+            # actor init in all gpus
+            self._placements["actor"] = PackedPlacementStrategy(
+                0, self._cluster_num_gpus - 1
             )
 
     @property

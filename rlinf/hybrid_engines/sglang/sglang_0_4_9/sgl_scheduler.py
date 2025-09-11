@@ -116,7 +116,7 @@ class Scheduler(_Scheduler, Worker):
                 )[(self.get_parent_rank(), self._rank)]
             )
         else:
-            assert self.placement_mode == PlacementMode.DISAGGREGATED, (
+            assert self.placement_mode in [PlacementMode.DISAGGREGATED, PlacementMode.AUTO], (
                 f"Unsupported placement mode: {self.placement_mode}"
             )
             rank_map = DisaggRankMapper.get_rollout_rank_to_actor_rank_map(

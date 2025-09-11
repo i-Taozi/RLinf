@@ -7,12 +7,15 @@ hydra:
   output_subdir: null
 
 cluster:
-  num_nodes: 8
+  num_nodes: 1
   num_gpus_per_node: 8
+  auto_scheduler : True
+  use_pre_process_policy : False
+  use_wait_before_last_iter_policy : True
   component_placement:
-    rollout: 0-15
-    inference: 16-23
-    actor: 24-63
+    actor: 0-1
+    rollout: 2-5
+    inference: 6-7
 
 runner:
   task_type: math
@@ -28,13 +31,13 @@ runner:
   val_check_interval: 1
   save_interval: 50
 
-  seq_length: 28672
+  seq_length: 10240 # 8196
 
   enable_dynamic_batch_size: False
-  max_tokens_per_mbs: 28672
+  max_tokens_per_mbs: 10240
 
   resume_dir: null
-  experiment_name: grpo-1.5b
+  experiment_name: 1.5b-10k-128bs-no-preprocess
   output_dir: ../results
 
 algorithm:
@@ -103,9 +106,9 @@ rollout:
     output_queue_name: "rollout_output_queue"
     queue_size: 64
 
-  gpu_memory_utilization: 0.55
+  gpu_memory_utilization: 0.4
 
-  model_dir: /path/to/model/DeepSeek-R1-Distill-Qwen-1.5B/
+  model_dir: /mnt/public/hf_models/DeepSeek-R1-Distill-Qwen-1.5B
   model_arch: qwen2.5
   enforce_eager: False         # if False, vllm will capture cuda graph, which will take more time to initialize.
   distributed_executor_backend: mp   # ray or mp
@@ -125,7 +128,7 @@ rollout:
   print_outputs: False         # whether to print the outputs (token ids, texts, etc.) of inference engine.
 
   sglang_decode_log_interval: 500000 # the interval for SGLang to log the decode time and other stats.
-  max_running_requests: 64 # the maximum number of running requests in the inference engine.
+  max_running_requests: 128 # the maximum number of running requests in the inference engine.
   cuda_graph_max_bs: 128 # the maximum batch size for cuda graph. If the batch size is larger than this, cuda graph will not be used.
 
   use_torch_compile: False # enable torch_compile in SGLang for rollout.
@@ -135,15 +138,15 @@ data:
   type: math
   max_prompt_length: 1024
   filter_prompt_by_length: True
-  rollout_batch_size: 512
+  rollout_batch_size: 128
   val_rollout_batch_size: null
   num_workers: 2
   prompt_key: prompt
   shuffle: True
   validation_shuffle: True
   seed: 1234
-  train_data_paths: ["/dataset/boba/AReaL-boba-106k.jsonl"]
-  val_data_paths: ["/dataset/boba/AReaL-boba-106k.jsonl"]
+  train_data_paths: ["/mnt/public/guozhen/data/boba_106k_0319_prompt_1024.jsonl"]
+  val_data_paths: ["/mnt/public/guozhen/data/boba_106k_0319_prompt_1024.jsonl"]
 
 actor:
   group_name: "ActorGroup"
@@ -156,7 +159,7 @@ actor:
     queue_name: "actor_input_queue"
     queue_size: 0
 
-  checkpoint_load_path: null
+  checkpoint_load_path: "/mnt/public/mg_ckpts/DeepSeek-R1-Distill-Qwen-1.5B-tp2-pp1-fp16" #"/mnt/public/mg_ckpts/Qwen2.5-Math-7B-tp4-pp1" #
 
   offload_optimizer: True
   offload_weight: True
@@ -213,8 +216,8 @@ actor:
     min_lr: 2.0e-6
     weight_decay: 0.05
     use_distributed_optimizer: True
-    overlap_grad_reduce: True
-    overlap_param_gather: True
+    overlap_grad_reduce: False
+    overlap_param_gather: False
     optimizer_enable_pin: false
     overlap_param_gather_with_optimizer_step: False
     clip_grad: 0.8
@@ -230,7 +233,7 @@ actor:
     lr_decay_iters: 10
 
   tokenizer:
-    tokenizer_model: /path/to/model/DeepSeek-R1-Distill-Qwen-1.5B/
+    tokenizer_model: /mnt/public/hf_models/DeepSeek-R1-Distill-Qwen-1.5B
     use_fast: False
     trust_remote_code: True
     padding_side: 'right'
@@ -243,7 +246,7 @@ actor:
     use_dist_ckpt: False
     tp_comm_bootstrap_backend: nccl
     tp_comm_overlap_cfg: null # tp_comm_overlap_cfg.yaml
-    use_hf_ckpt: True # if true, will transfer hf model to generate megatron checkpoint and use it for training.
+    use_hf_ckpt: False # if true, will transfer hf model to generate megatron checkpoint and use it for training.
     use_profiler: False # if true, will enable torch profiler when training, pay attention it has influence on performance
 
     ckpt_convertor: # config for ckpt convertor

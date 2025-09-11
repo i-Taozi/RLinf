@@ -50,6 +50,8 @@ from rlinf.workers.rollout.utils import (
 )
 
 from .io_struct import (
+    AbortGenerationInput,
+    AbortGenerationOutput,
     OffloadReqInput,
     OffloadReqOutput,
     SyncHFWeightInput,
@@ -98,6 +100,7 @@ class Scheduler(_Scheduler, Worker):
                 (OffloadReqInput, self.offload_model_weights),
                 (SyncWeightInput, self.sync_weight),
                 (SyncHFWeightInput, self.sync_hf_weight),
+                (AbortGenerationInput, self.abort_generation),
             ]
         )
         self.cfg = config
@@ -115,7 +118,7 @@ class Scheduler(_Scheduler, Worker):
                 )[(self.get_parent_rank(), self._rank)]
             )
         else:
-            assert self.placement_mode == PlacementMode.DISAGGREGATED, (
+            assert self.placement_mode in [PlacementMode.DISAGGREGATED, PlacementMode.AUTO], (
                 f"Unsupported placement mode: {self.placement_mode}"
             )
             rank_map = DisaggRankMapper.get_rollout_rank_to_actor_rank_map(
@@ -135,6 +138,13 @@ class Scheduler(_Scheduler, Worker):
         for _, module in self.tp_worker.worker.model_runner.model.named_modules():
             if hasattr(module, "use_presharded_weights"):
                 module.use_presharded_weights = True
+
+        self.use_cudagraph = not self.cfg.rollout.enforce_eager
+        self.colocate = self.placement_mode == PlacementMode.COLLOCATED
+        if not self.colocate:
+            assert self.use_cudagraph, "If not colocate, use_cudagraph must be True now."
+
+        self.is_cudagraph_offload = False
 
         self._logger.info(
             f"Running Scheduler dp rank {self.get_parent_rank()}, tp rank {self.tp_rank}, corresponding actor weight rank = {self.actor_weight_rank}"
@@ -161,14 +171,13 @@ class Scheduler(_Scheduler, Worker):
         )
 
     def offload_model_weights(self, recv_req: OffloadReqInput):
-        use_cudagraph = not self.cfg.rollout.enforce_eager
-        colocate = self.placement_mode == PlacementMode.COLLOCATED
-        if not colocate:
-            assert use_cudagraph, "If not colocate, use_cudagraph must be True now."
-
-        if use_cudagraph or not colocate:
-            self.release_memory_occupation(ReleaseMemoryOccupationReqInput())
-            # self.cuda_info("After offload Model weights and kv cache")
+        if self.use_cudagraph:
+            if self.is_cudagraph_offload:
+                self.log_warning("already offloaded. please do not offload again.")
+            else:
+                self.release_memory_occupation(ReleaseMemoryOccupationReqInput())
+                # self.cuda_info("After offload Model weights and kv cache")
+                self.is_cudagraph_offload = True
             return OffloadReqOutput()
 
         # manually offload
@@ -194,11 +203,6 @@ class Scheduler(_Scheduler, Worker):
         return OffloadReqOutput()
 
     def sync_hf_weight(self, recv_req: SyncHFWeightInput):
-        use_cudagraph = not self.cfg.rollout.enforce_eager
-        colocate = self.placement_mode == PlacementMode.COLLOCATED
-
-        assert use_cudagraph, "use_cudagraph must be True now."
-
         state_dict = self.recv(
             src_group_name=self._actor_group_name,
             src_rank=self.actor_weight_rank,
@@ -206,7 +210,7 @@ class Scheduler(_Scheduler, Worker):
 
         model = self.tp_worker.worker.model_runner.model
 
-        if colocate:
+        if self.colocate:
             self.resume_memory_occupation(ResumeMemoryOccupationReqInput())
             for name, handle in state_dict.items():
                 func, args = handle
@@ -219,29 +223,45 @@ class Scheduler(_Scheduler, Worker):
                 model.load_weights([(name, new_weight)])
                 del new_weight
         else:
+            if self.use_cudagraph and self.is_cudagraph_offload:
+                self.resume_memory_occupation(ResumeMemoryOccupationReqInput())
+
             # disaggregate mode, recv tensor directly
             for name, tensor in state_dict.items():
                 model.load_weights([(name, tensor)])
+
+            self.is_cudagraph_offload = False
         self.sync_in_tp("sync_hf_weight")
         return SyncHFWeightOutput()
 
-    def sync_weight(self, recv_req: SyncWeightInput):
-        use_cudagraph = not self.cfg.rollout.enforce_eager
-        colocate = self.placement_mode == PlacementMode.COLLOCATED
-        if not colocate:
-            assert use_cudagraph, "If not colocate, use_cudagraph must be True now."
+    def abort_generation(self, recv_req: AbortGenerationInput):
+        # clear waiting reqs
+        waiting_reqs = []
+        # waiting_reqs.append(self.waiting_queue)
+        for req in self.waiting_queue:
+            req.to_abort = True
 
+        # abort every running req with no kvcache
+        running_reqs = []
+        running_reqs.append(self.running_batch.reqs)
+        for req in self.running_batch.reqs:
+            req.to_abort = True
+        res = AbortGenerationOutput(waiting_reqs=waiting_reqs, running_reqs=running_reqs)
+        return res
+
+    def sync_weight(self, recv_req: SyncWeightInput):
         state_dict = self.recv(
             src_group_name=self._actor_group_name,
             src_rank=self.actor_weight_rank,
         )
         model = self.tp_worker.worker.model_runner.model
 
-        if use_cudagraph and colocate:
+        if self.use_cudagraph and self.is_cudagraph_offload:
             self.resume_memory_occupation(ResumeMemoryOccupationReqInput())
+            self.is_cudagraph_offload = False
 
-        if colocate:
-            if use_cudagraph:
+        if self.colocate:
+            if self.use_cudagraph:
                 for name, handle in state_dict.items():
                     func, args = handle
                     list_args = list(args)

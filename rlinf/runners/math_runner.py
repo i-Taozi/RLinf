@@ -412,8 +412,7 @@ class MathPipelineRunner:
         inference: MegatronInference,
         critic=None,
         reward=None,
-        resharding_strategies=None,
-        frist_resharding_state=-1
+        scheduler_task=None,
     ):
         self.cfg = cfg
 
@@ -438,6 +437,10 @@ class MathPipelineRunner:
         self.metric_logger = MetricLogger(cfg)
 
         self._set_max_steps()
+        self.scheduler_task = scheduler_task
+        self.use_pre_process_policy = self.cfg.cluster.use_pre_process_policy and (scheduler_task is not None)
+        
+
 
     def init_workers(self):
         if self.cfg.runner.resume_dir is None:
@@ -452,13 +455,30 @@ class MathPipelineRunner:
                     self.cfg.actor.megatron.ckpt_convertor.hf_model_path,
                     self.cfg.actor.megatron.ckpt_convertor,
                 )
-            self.actor.init_worker().wait()
-            self.rollout.init_worker().wait()
-            self.inference.init_worker().wait()
+            if self.use_pre_process_policy:
+                self.rollout.init_worker().wait()
+                self.rollout.offload_engine().wait()
+                self.actor.init_worker().wait()
+                self.inference.init_worker().wait()
+            else:
+                self.actor.init_worker().wait()
+                self.inference.init_worker().wait()
+                self.rollout.init_worker().wait()
+                self._sync_weights()
+                
+            # # dev0910
+            # self.rollout.init_worker().wait()
+            # if self.use_pre_process_policy:
+            #     self.rollout.offload_engine().wait()
+            # self.actor.init_worker().wait()
+            # self.inference.init_worker().wait()
+            
+            # if not self.use_pre_process_policy:
+            #     self._sync_weights()
 
-            self._sync_weights()
             return
 
+        
         logging.info(f"Load from checkpoint folder: {self.cfg.runner.resume_dir}")
         # set global step
         self.global_steps = int(self.cfg.runner.resume_dir.split("global_step_")[-1])
@@ -470,7 +490,6 @@ class MathPipelineRunner:
         # load actor
         self.actor.init_worker().wait()
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
-
         rollout_init_future = self.rollout.init_worker()
         inference_init_future = self.inference.init_worker()
         rollout_init_future.wait()
@@ -501,6 +520,23 @@ class MathPipelineRunner:
         actor_sync_handle.wait()
         actor_send_handle.wait()
         infer_recv_handle.wait()
+    
+            
+    def _sync_weights_for_auto_scheduler(self):
+        logging.info(f"[debug-hjh] start _sync_weights_for_inference")
+        actor_send_handle = self.actor.sync_model_to_inference()
+        infer_recv_handle = self.inference.sync_model_from_actor()
+        actor_send_handle.wait()
+        infer_recv_handle.wait()
+        
+        
+        logging.info(f"[debug-hjh] start _sync_weights_for_rollout")
+        rollout_sync_handle = self.rollout.sync_model_from_actor()
+        actor_sync_handle = self.actor.sync_model_to_rollout()
+        rollout_sync_handle.wait()
+        actor_sync_handle.wait()
+        self.actor.del_reshard_state_dict().wait()
+        
 
     def _save_checkpoint(self):
         base_output_dir = os.path.join(
@@ -540,7 +576,14 @@ class MathPipelineRunner:
         )
 
         for _ in epoch_iter:
+            if self.scheduler_task is not None:
+                scheduler_handle = self.scheduler_task.run()
             with self.timer("step"):
+                
+                if self.use_pre_process_policy:
+                    with self.timer("sync_weights"):
+                        self._sync_weights_for_auto_scheduler()
+                    
                 rollout_handle = self.rollout.rollout()
                 infer_handle = self.inference.run_inference()
                 train_handle = self.actor.run_training_pipeline()
@@ -552,8 +595,11 @@ class MathPipelineRunner:
                         infer_handle.wait()
                     rollout_actor_metrics = train_handle.wait()
 
-                with self.timer("sync_weights"):
+                if not self.use_pre_process_policy:
                     self._sync_weights()
+                    
+                if self.scheduler_task is not None:
+                    scheduler_handle.wait()
 
                 self.global_steps += 1
 

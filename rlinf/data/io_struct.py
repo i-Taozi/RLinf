@@ -93,21 +93,6 @@ class CompletionInfo:
 
         self.logger = logger
 
-    def hash(self, token_ids: List[int]) -> int:
-        """Generate a hash for the token IDs."""
-        return hash(tuple(token_ids))
-
-    def clear(self):
-        self.complete_num.clear()
-        self.input_ids.clear()
-        self.results.clear()
-        self.num_requests = 0
-        self.num_completed = 0
-        self._num_returned = 0
-        self.unique_id_inc = 0
-        self.unique_id_map: Dict[int, int] = {}  # unique_id -> hash
-        self.answers.clear()
-
     def add_request(self, req: RolloutRequest):
         """Add a new request to the completion info."""
         if self.n_result_each_request != 0:
@@ -151,17 +136,8 @@ class CompletionInfo:
 
         return len(self.results[unique_id])
 
-    def is_completed(self, hash_id: int) -> bool:
-        return self.complete_num[hash_id] == self.n_result_each_request
-
-    def get_results(self, hash_id: int) -> List[Dict]:
-        """Get the results for the given token IDs."""
-        assert hash_id in self.results, "Hash ID not found in results"
-        assert self.complete_num[hash_id] == self.n_result_each_request, (
-            "Not all results for this hash ID are completed"
-        )
-        value = self.results.pop(hash_id)
-        return value
+    def is_completed(self, unique_id: int) -> bool:
+        return len(self.results[unique_id]) == self.n_result_each_request
 
     def pop_results(self, unique_id: int):
         """Get the results for the given token IDs."""
@@ -422,6 +398,7 @@ class RolloutResult:
             left_pad=True,
         )
 
+        
         response_ids = batch_pad_to_fixed_len(
             [torch.as_tensor(ids, dtype=torch.long) for ids in self.response_ids],
             max_batch_len=max_response_len,

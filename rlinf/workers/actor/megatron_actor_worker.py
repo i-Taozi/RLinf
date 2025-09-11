@@ -155,7 +155,7 @@ class MegatronActor(MegatronModelManager, Worker):
 
         self.component_placement = placement
 
-        if self.component_placement.placement_mode == PlacementMode.DISAGGREGATED:
+        if self.component_placement.placement_mode in [PlacementMode.DISAGGREGATED, PlacementMode.AUTO]:
             self._data_channel = self.connect_channel(
                 channel_name=role_cfg.channel.name
             )
@@ -182,15 +182,24 @@ class MegatronActor(MegatronModelManager, Worker):
             self.use_schedule = self.cfg.cluster.placement.use_schedule
         except Exception as e:
             self.use_schedule = False
-        if self.use_schedule:
+        
+        self.use_auto_scheduler = (self.component_placement._placement_mode == PlacementMode.AUTO)
+        self.use_pre_process_policy = self.cfg.cluster.use_pre_process_policy and self.use_auto_scheduler
+        self.resharding_state = True
+        if self.use_auto_scheduler:
+            from rlinf.scheduler.dynamic_scheduler.util import (
+                get_scheduler_channel,
+                get_scheduler_request_queue,
+                get_scheduler_response_queue,
+            )
             assert HAVE_RESHARDING, "params_resharding is required for scheduler"
-            self.schedule_channel = self.connect_channel(self.cfg.cluster.placement.schedule_channel_name)
+            self.schedule_channel = self.connect_channel(get_scheduler_channel(role))
             # warmup
             self.schedule_channel.put(None, async_op=False)
             self.schedule_channel.get(async_op=False)
-
-            self.schedule_req_queue_name = self.cfg.cluster.placement.schedule_req_queue_name
-            self.schedule_resp_trainer_queue = self.cfg.cluster.placement.schedule_resp_trainer_queue_name
+            
+            self.scheduler_request_queue = get_scheduler_request_queue(self._rank)
+            self.scheduler_response_queue = get_scheduler_response_queue(self._rank)
 
     def _init_profiler(self):
         def _validate_schedule_info():
@@ -232,6 +241,11 @@ class MegatronActor(MegatronModelManager, Worker):
 
     def init_worker(self):
         self.setup_model_and_optimizer()
+        
+        if self.use_auto_scheduler:
+            self.init_trainer_resharding()
+            if not self.resharding_state:
+                return
 
         ref_policy_state_dict = None
         # only need this if we are running with inital kl penalty & full-parameter tuning
@@ -731,7 +745,49 @@ class MegatronActor(MegatronModelManager, Worker):
 
         return training_metrics_list
 
+    def sync_with_scheduler(self):
+        if not self.use_auto_scheduler:
+            return
+
+        if self._rank == 0:
+            self.log_info(f"[dev-hjh] Actor update state to scheduler, using queue {self.scheduler_response_queue}")
+            self.schedule_channel.put(
+                None, queue_name=self.scheduler_response_queue, async_op=True
+            ).wait()
+
+            self.log_info(f"[dev-hjh] Actor start recv resharding_resp, using queue {self.scheduler_request_queue}")
+            resharding_resp = self.schedule_channel.get(
+                queue_name=self.scheduler_request_queue,
+                async_op=False,
+            )
+
+            self.log_info(f"[dev-hjh] Actor finish recv resharding_resp, resharding_resp={resharding_resp}")
+        else:
+            resharding_resp = None
+        
+        parallel_state.barrier_with_gloo()
+        resharding_resp = self.broadcast_obj(resharding_resp)
+        self.log_info(f"[debug-hjh] rank={self._rank}, resharding_resp={resharding_resp}")
+        
+        if resharding_resp is not None:
+            self.apply_parallel_strategy(resharding_resp)
+            self.calc_num_microbatches()
+       
+        
+
+
     def run_training_pipeline(self):
+        # dev0910
+        if self.use_pre_process_policy:
+            self.log_info(f"[dev-hjh] Actor wait for main_loop")
+            if self._rank == 0:
+                self.schedule_channel.get(queue_name=self.scheduler_request_queue,async_op=True).wait()
+            parallel_state.barrier_with_gloo()
+            self.log_info(f"[dev-hjh] Actor finish for main_loop")
+            if self.resharding_state:
+                self.onload_model_weights_and_grad(load_grad=self.offload_grad)
+                self.onload_megatron_optimizer()
+        
         set_train(self)
         self.calc_num_microbatches()
 
@@ -740,20 +796,25 @@ class MegatronActor(MegatronModelManager, Worker):
 
         training_metrics_list = []
         for _ in range(num_opt_step):
-            if not self.check_resharding(is_end=False):
-                continue
-            batch = self.batch_iterator
-            training_metrics = self.training_step(batch, pipeline_func=True)
-            training_metrics_list.append(training_metrics)
+            self.log_info(f"[debug-hjh] rank={self._rank}, iter={_}, self.resharding_state={self.resharding_state}")
+            if self.resharding_state:
+                batch = self.batch_iterator
+                training_metrics = self.training_step(batch, pipeline_func=True)
+                training_metrics_list.append(training_metrics)
+            # if not self.check_resharding(is_end=False):
+            #     continue
+        
+            self.sync_with_scheduler()
 
-        self.check_resharding(is_end=True)
+
+        # self.check_resharding(is_end=True)
 
         rollout_metrics_valid_dp_group = self.process_rollout_metrics_with_elastic()
         if rollout_metrics_valid_dp_group is None:
             return
         rollout_metrics = RolloutResult.to_metrics(self._batch_buffer_for_metrics)
         rollout_metrics = compute_rollout_metrics_pipeline(
-            rollout_metrics, self.cfg.data.max_prompt_length, self.response_len, rollout_metrics_valid_dp_group
+            rollout_metrics, self.cfg.data.max_prompt_length, self.response_len, data_parallel_group=rollout_metrics_valid_dp_group
         )
         self.average_respone_len = rollout_metrics["response_length"]
 
@@ -761,11 +822,13 @@ class MegatronActor(MegatronModelManager, Worker):
 
     # Elastic-Training
     def process_rollout_metrics_with_elastic(self):
-        if not self.use_schedule:
+        if not self.use_auto_scheduler:
             return parallel_state.get_data_parallel_group()
 
         max_data_parallel_group = parallel_state.get_data_parallel_group_elastic_max()
         max_data_parallel_ranks = torch.distributed.get_process_group_ranks(max_data_parallel_group)
+        
+        self.log_info(f"rank={self._rank}, max_data_parallel_ranks={max_data_parallel_ranks}")
 
         rollout_metrics_dp_ranks_states = torch.tensor([(dp_rank == self._rank and len(self._batch_buffer_for_metrics) > 0) for dp_rank in max_data_parallel_ranks]).cuda()
         torch.distributed.all_reduce(rollout_metrics_dp_ranks_states, torch.distributed.ReduceOp.MAX, group=max_data_parallel_group)
@@ -778,7 +841,7 @@ class MegatronActor(MegatronModelManager, Worker):
         return None
 
     def calc_num_microbatches(self):
-        if self.use_schedule and self.resharding_state != ReshardingState.RUN:
+        if not self.resharding_state:
             return
         configure_batch_sizes(
                 rank=torch.distributed.get_rank(),
@@ -788,80 +851,93 @@ class MegatronActor(MegatronModelManager, Worker):
             )
         self.log_info(f"run_training_pipeline: mbs={self.cfg.actor.micro_batch_size}, gbs={self.cfg.actor.global_batch_size}, dp={parallel_state.get_data_parallel_world_size()} {get_num_microbatches()=}")
 
-    def init_trainer_resharding(self, resharding_strategies, frist_resharding_state : int):
+    def init_trainer_resharding(self, first_world_size:int = -1):
         """Init resharding func.
-
-        Args:
-            trainer_parallel_strategies (List[Dict[str, int]]): Megatron's training parallel strategy, the first strategy should be the same as cfg.
-            frist_resharding_state (int) : The first resharding state to apply
         """
+        from rlinf.scheduler.dynamic_scheduler.util import (
+            get_valid_dp_sizes
+        )
         assert HAVE_RESHARDING, "params_resharding is not installed"
-
-        trainer_parallel_strategies = []
-        tag_to_state_id = {}
-        for k, v in list(resharding_strategies.items())[::-1]:
-            tag_to_state_id[k] = len(tag_to_state_id)
-            trainer_parallel_strategies.append({
-                "world_size" : v['trainer']['ws'],
-                "tensor_model_parallel_size":v['trainer']['tp'],
-                "pipeline_model_parallel_size":v['trainer']['pp'],
-                "context_parallel_size":v['trainer']['cp'],
-                "data_parallel_size":v['trainer']['dp'],
-            })
-
-        self.resharding_strategies = resharding_strategies
-        self.trainer_parallel_strategies = trainer_parallel_strategies
-        self.tag_to_state_id = tag_to_state_id
-
+        
+        
         args = get_args()
         args.rank = torch.distributed.get_rank()
         args.world_size = torch.distributed.get_world_size()
         args.data_parallel_size = args.world_size // (args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size)
         args.load = None
-
-
+        self.default_parallel_strategy = {
+            "tensor_model_parallel_size": args.tensor_model_parallel_size,
+            "pipeline_model_parallel_size": args.pipeline_model_parallel_size,
+            "context_parallel_size": args.context_parallel_size
+        }
+        default_model_parallel_size_with_cp = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
+        
+        assert args.world_size == self.component_placement._cluster_num_gpus, "In Auto-Scheduler mode, actor should be initialized on all GPUs."
+        assert self.component_placement.actor_world_size < args.world_size
+        
+        
+        valid_dp_sizes = get_valid_dp_sizes(self.cfg, default_model_parallel_size_with_cp)
+        assert len(valid_dp_sizes) > 0
+        resharding_strategies = []
+        
+        for valid_dp_size in reversed(valid_dp_sizes):
+            world_size = default_model_parallel_size_with_cp * valid_dp_size
+            assert world_size <= self.component_placement._cluster_num_gpus
+            
+            resharding_strategies.append(
+                {
+                    "world_size" : world_size,
+                    "tensor_model_parallel_size": args.tensor_model_parallel_size,
+                    "pipeline_model_parallel_size": args.pipeline_model_parallel_size,
+                    "context_parallel_size": args.context_parallel_size
+                }
+            )
+        
+        assert resharding_strategies[0]['world_size'] == args.world_size
+            
         self.trainer_resharding_func : Callable = resharding_init(
             model = self.model,
             optimizer = self.optimizer,
             opt_param_scheduler = self.lr_scheduler,
-            trainer_parallel_strategies = trainer_parallel_strategies,
+            trainer_parallel_strategies = resharding_strategies,
             offload_frist_strategy = False,
             model_provider = self.model_provider_func,
         )
+        
+        if first_world_size == -1:
+            first_world_size = self.component_placement.actor_world_size
+        
+        self.resharding_state = True
+        self.apply_parallel_strategy({'world_size':first_world_size})
 
-        self.resharding_state : ReshardingState = ReshardingState.RUN
-        if frist_resharding_state != 0:
-            self.apply_parallel_strategy(frist_resharding_state)
-
-    def apply_parallel_strategy(self, resharding_state_id : int = -1, new_parallel_strategy : Optional[Dict[str, int]] = None) -> bool:
+    def apply_parallel_strategy(self, parallel_strategy):
         """Apply specified training parallel strategy
-
-        Args:
-            is_survival_node (bool): The last return value of the current function, indicating whether cur_rank is currently training
-            resharding_state_id (int): Index of self.trainer_parallel_strategies, apply self.trainer_parallel_strategies[resharding_state_id] as new parallel strategy
-            new_parallel_strategy (Dict[str, int]): Register and apply a new parallel strategy
-
-        Return:
-            is_survival_node (bool) : Return True if this rank is new/survival node
         """
-
-        if resharding_state_id == -1:
-            assert new_parallel_strategy is not None
-            self.trainer_parallel_strategies.append(new_parallel_strategy)
-        else:
-            assert new_parallel_strategy is None
-
-        self._logger.info(f"[ElasticMegatron-Info] rank={torch.distributed.get_rank()} start resharing with state_id = {resharding_state_id}")
-        training_states, new_state_id = self.trainer_resharding_func(new_state_id=resharding_state_id, new_parallel_strategy=new_parallel_strategy)
-
-        self.resharding_state_id = new_state_id
+        args = get_args()
+        args.load = None
+        
+        parallel_keys = ["world_size", "tensor_model_parallel_size", "pipeline_model_parallel_size", "context_parallel_size"]
+        assert parallel_strategy.get("world_size") is not None, f"Error : can't find world_size in parallel_strategy"
+        if parallel_strategy.get('context_parallel_size') is not None:
+            assert parallel_strategy['context_parallel_size'] == self.default_parallel_strategy['context_parallel_size'], "change context_parallel_size is not supported"
+            
+        new_parallel_strategy = {}
+        for parallel_key in parallel_keys:
+            if parallel_strategy.get(parallel_key) is not None:
+                new_parallel_strategy[parallel_key] = parallel_strategy[parallel_key]
+            else:
+                new_parallel_strategy[parallel_key] = self.default_parallel_strategy[parallel_key]
+        
+        self._logger.info(f"[ElasticMegatron-Info] rank={torch.distributed.get_rank()} start resharing with new_parallel_strategy = {new_parallel_strategy}")
+        training_states, _ = self.trainer_resharding_func(new_parallel_strategy=new_parallel_strategy)
+        
         if training_states is not None:
             self.model = training_states.model
             self.optimizer = training_states.optimizer
             self.lr_scheduler = training_states.opt_param_scheduler
-            self.resharding_state = ReshardingState.RUN
+            self.resharding_state = True
         else:
-            self.resharding_state = ReshardingState.CONTINUE
+            self.resharding_state = False
 
     # Elastic-Training TODO(Chunyang)
     def broadcast_obj(self, obj):
@@ -1026,6 +1102,8 @@ class MegatronActor(MegatronModelManager, Worker):
         )
 
     def sync_model_to_inference(self):
+        if not self.resharding_state:
+            return
         inference_state_dict = self._get_inference_model_state_dict()
 
         for rank in self._weight_dst_rank_in_inference:
@@ -1123,7 +1201,7 @@ class MegatronActor(MegatronModelManager, Worker):
             )
         else:
             assert (
-                self.component_placement._placement_mode == PlacementMode.DISAGGREGATED
+                self.component_placement._placement_mode in [PlacementMode.DISAGGREGATED, PlacementMode.AUTO]
             ), "Unsupported placement mode for token and weight destination ranks."
             self._weight_dst_rank_in_rollout = (
                 DisaggRankMapper.get_actor_rank_to_rollout_ranks(
@@ -1143,6 +1221,8 @@ class MegatronActor(MegatronModelManager, Worker):
             del self.reshard_state_dict
 
     def sync_model_to_rollout(self):
+        if not self.resharding_state:
+            return
         """Send the model weights to the destination ranks in the rollout task."""
         if self.component_placement._placement_mode == PlacementMode.COLLOCATED:
             if self.offload_optimizer:
@@ -1155,9 +1235,9 @@ class MegatronActor(MegatronModelManager, Worker):
             self.send(
                 handle, self._rollout_group_name, self._weight_dst_rank_in_rollout
             )
-        else:
+        elif not self.use_pre_process_policy:
             assert (
-                self.component_placement._placement_mode == PlacementMode.DISAGGREGATED
+                self.component_placement._placement_mode in [PlacementMode.DISAGGREGATED, PlacementMode.AUTO]
             ), "Unsupported placement mode for sending weights."
             assert isinstance(self._weight_dst_rank_in_rollout, list), (
                 f"In disaggregated mode, weight_dst_rank_in_rollout should be a list of ranks, got {type(self._weight_dst_rank_in_rollout)}"
@@ -1169,6 +1249,39 @@ class MegatronActor(MegatronModelManager, Worker):
                     self._rollout_group_name,
                     weight_dst_rank,
                 )
+        else:
+            assert (
+                self.component_placement._placement_mode == PlacementMode.AUTO
+            ), "Unsupported placement mode for sending weights."
+            torch.cuda.synchronize()
+            self.reshard_state_dict = self._get_rollout_model_state_dict()
+            torch.cuda.synchronize()
+            
+            self.cuda_info("before offload")
+            self.offload_model_weights_and_grad(offload_grad=True)
+            self.cuda_info("after offload model")
+            self.offload_megatron_optimizer()
+            self.cuda_info("after offload opt")
+                
+            for weight_dst_rank in self._weight_dst_rank_in_rollout:
+                self.send(
+                    self.reshard_state_dict,
+                    self._rollout_group_name,
+                    weight_dst_rank,
+                )
+    
+    def cuda_info(self, text: str = ""):
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
+        free_gpu_memory /= 2**30
+        total_gpu_memory /= 2**30
+
+        memory_allocated = torch.cuda.memory_allocated() / 2**30
+        memory_reserved = torch.cuda.memory_reserved() / 2**30
+
+        self._logger.info(f"{text} {memory_allocated=:.2f} GiB, {memory_reserved=:.2f} GiB, {free_gpu_memory=:.2f} GiB, {total_gpu_memory=:.2f} GiB")
+            
 
     def _get_rollout_result(self, rollout_channel: Channel):
         """Receive rollout results."""

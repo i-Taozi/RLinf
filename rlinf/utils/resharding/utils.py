@@ -266,7 +266,12 @@ def tp_reshard_fn_qwen2_5(model_state_dict, merge_factor, tp_group):
             or "mlp.linear_fc1.layer_norm_weight" in k
             or "final_layernorm.weight" in k
         ):
-            model_state_dict[k] = v.clone()
+            try:
+                model_state_dict[k] = v.clone()
+            except RuntimeError as e:
+                print(f"error={e}, k={k}")
+                print(f"v={v}")
+                raise e
             continue
 
         dim = 0

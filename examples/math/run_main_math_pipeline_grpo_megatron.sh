@@ -9,7 +9,8 @@ export RAY_DEDUP_LOGS=0
 
 CONFIG_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_PATH=$(dirname $(dirname "$CONFIG_PATH"))
-export PYTHONPATH=${REPO_PATH}:$PYTHONPATH
+export PYTHONPATH=${REPO_PATH}:/mnt/public/hujunhao:/mnt/public/hujunhao/ElasticMegatron:$PYTHONPATH
+# export PYTHONPATH=${REPO_PATH}:/mnt/public/hujunhao:/mnt/public/hujunhao/params_resharding_release:$PYTHONPATH
 
 if [ -z "$1" ]; then
     CONFIG_NAME="qwen2.5-1.5b-grpo-megatron-pipeline"
