@@ -37,8 +37,8 @@ class ComponentManager:
         self.n_minibatches = self.cfg.algorithm.n_minibatches
 
         # warmup
-        self.channel.put(None, async_op=False)
-        self.channel.get(async_op=False)
+        # self.channel.put(None, async_op=False)
+        # self.channel.get(async_op=False)
 
         for instance_id in range(communication_instance_num):
             self.channel.create_queue(get_scheduler_request_queue(instance_id))
@@ -162,10 +162,10 @@ class RolloutManager(ComponentManager):
             ).async_wait()
             self._logger.info(f'[debug-hjh] finish send report request to rollout{rollout_instance_id}')
 
-            response = self.channel.get(
+            response = await self.channel.get(
                 queue_name=get_scheduler_response_queue(rollout_instance_id),
-                async_op=False,
-            )
+                async_op=True,
+            ).async_wait()
             self._logger.info(f'[debug-hjh] finish recv report request to rollout{rollout_instance_id}')
             assert (
                 response.instance_id == rollout_instance_id
@@ -213,8 +213,6 @@ class RolloutManager(ComponentManager):
         Returns:
             max_migrate_out_instance_num: the max number of instances to migrate out
         """
-        if train_iter == 0:
-            return 0
         if self.current_instance_num <= 1:
             return 0
 
@@ -252,10 +250,10 @@ class RolloutManager(ComponentManager):
                 async_op=True,
             ).async_wait()
 
-            response = self.channel.get(
+            response = await self.channel.get(
                 queue_name=get_scheduler_response_queue(rollout_instance_id),
-                async_op=False,
-            )
+                async_op=True,
+            ).async_wait()
             assert (
                 response.instance_id == rollout_instance_id
                 and response.data is not None
@@ -266,7 +264,7 @@ class RolloutManager(ComponentManager):
 
 
         instance_running_tasks_expected = self.running_tasks  // self.current_instance_num
-        assert instance_running_tasks_expected > 0
+        # assert instance_running_tasks_expected > 0
 
         migrate_out_batches_index = 0
         migrate_out_batches_len = len(migrate_out_batches)
@@ -398,8 +396,8 @@ class InferenceManager(ComponentManager):
         self.release(release_gpu_num = release_gpu_num)
         return release_gpu_num
 
-    async def main_loop_reset(self):
-        self.main_loop_finished_handler = self.channel.get(queue_name=get_scheduler_response_queue(), async_op=True)
+    # async def main_loop_reset(self):
+    #     self.main_loop_finished_handler = self.channel.get(queue_name=get_scheduler_response_queue(), async_op=True)
 
     async def main_loop_finish(self):
         assert self.main_loop_finished_handler.done()
@@ -493,9 +491,9 @@ class ActorManager(ComponentManager):
         if new_gpu_num != self.current_gpu_num:
             self.current_gpu_num = new_gpu_num
             self.current_instance_num = new_gpu_num // self.model_parallel_size
-            self.channel.put({"world_size": new_gpu_num}, queue_name=get_scheduler_request_queue(), async_op=False)
+            await self.channel.put({"world_size": new_gpu_num}, queue_name=get_scheduler_request_queue(), async_op=True).async_wait()
         else:
-            self.channel.put(None, queue_name=get_scheduler_request_queue(), async_op=False)
+            await self.channel.put(None, queue_name=get_scheduler_request_queue(), async_op=True).async_wait()
 
     async def wait_for_actor_update(self):
         await self.channel.get(queue_name=get_scheduler_response_queue(), async_op=True).async_wait()

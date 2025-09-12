@@ -758,8 +758,8 @@ class MegatronActor(MegatronModelManager, Worker):
             self.log_info(f"[dev-hjh] Actor start recv resharding_resp, using queue {self.scheduler_request_queue}")
             resharding_resp = self.schedule_channel.get(
                 queue_name=self.scheduler_request_queue,
-                async_op=False,
-            )
+                async_op=True,
+            ).wait()
 
             self.log_info(f"[dev-hjh] Actor finish recv resharding_resp, resharding_resp={resharding_resp}")
         else:

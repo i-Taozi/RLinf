@@ -643,7 +643,7 @@ class AsyncSGLangWorker(SGLangWorker):
             )
             scheduler_response = RolloutScheduleInfo(instance_id=self._rank, report=report) 
             
-            self.schedule_channel.put(scheduler_response, queue_name=self.scheduler_response_queue, async_op=False)
+            await self.schedule_channel.put(scheduler_response, queue_name=self.scheduler_response_queue, async_op=True).async_wait()
             self.log_info(f"[dev-hjh] rollout_{self._rank} finish Report action")
         
         async def migrate_out(): 
@@ -668,7 +668,7 @@ class AsyncSGLangWorker(SGLangWorker):
                 )
             
             scheduler_response = RolloutScheduleInfo(instance_id=self._rank, data=rollout_migrate_batches)
-            self.schedule_channel.put(scheduler_response, queue_name=self.scheduler_response_queue, async_op=False)
+            await self.schedule_channel.put(scheduler_response, queue_name=self.scheduler_response_queue, async_op=True).async_wait()
             self.log_info(f"[dev-hjh] rollout_{self._rank} finish Migrate_Out action")
             
             
@@ -720,6 +720,9 @@ class AsyncSGLangWorker(SGLangWorker):
                 task_queue.set_exit_flag()
 
             if task_queue.exit_flag == True:
+                running_tasks=sum(completion_info.n_result_each_request - len(i) for i in completion_info.results.values())
+                assert running_tasks == 0, f"ready to break run_with_scheduler() but running_tasks={running_tasks}"
+                self.log_info(f"[debug-hjh] rollout-{self._rank} break run_with_scheduler()")
                 break
 
 
