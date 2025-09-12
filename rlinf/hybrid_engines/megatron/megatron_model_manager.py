@@ -63,6 +63,7 @@ from megatron.training.training import (
     preprocess_common_state_dict,
     setup_model_and_optimizer,
     unwrap_model,
+    get_args,
 )
 
 try:
@@ -285,8 +286,8 @@ class MegatronModelManager:
     def save_checkpoint(
         self, checkpoint_save_path, step, num_floating_point_operations_so_far=0
     ):
-        self._cfg.megatron.save = checkpoint_save_path
-        set_megatron_args(self._cfg)
+        args = get_args()
+        args.save = checkpoint_save_path
         save_checkpoint(
             iteration=step,
             model=self.model,
@@ -298,8 +299,8 @@ class MegatronModelManager:
         )
 
     def load_checkpoint(self, checkpoint_load_path):
-        self._cfg.megatron.load = checkpoint_load_path
-        set_megatron_args(self._cfg)
+        args = get_args()
+        args.load = checkpoint_load_path
         load_checkpoint(
             self.model,
             self.optimizer,

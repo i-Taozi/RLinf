@@ -17,6 +17,7 @@ import os
 from typing import Dict, Optional, Union
 
 import pandas as pd
+from rlinf.scheduler.dynamic_scheduler.scheduler_task import SchedulerTask
 import torch
 from omegaconf.dictconfig import DictConfig
 from torch.utils.data import Dataset, RandomSampler, SequentialSampler
@@ -53,6 +54,7 @@ class MathRunner:
         inference: Optional[MegatronInference],
         actor: MegatronActor,
         reward: Optional[Worker] = None,
+        scheduler_task : SchedulerTask = None,
     ):
         """"""
         self.cfg = cfg
@@ -67,6 +69,10 @@ class MathRunner:
         # Collocated mode uses actor as inference
         self.inference = inference if self.has_dedicated_inference else self.actor
         self.reward = reward if self.has_dedicated_reward else self.actor
+
+        # Scheduler task
+        self.scheduler_task = scheduler_task
+        self.use_pre_process_policy = self.cfg.cluster.use_pre_process_policy and (scheduler_task is not None)
 
         # Data channels
         self.dataloader_channel = Channel.create("DataLoader")
@@ -172,8 +178,13 @@ class MathRunner:
                 )
 
         # Init workers
-        self.rollout.init_worker().wait()
-        self.actor.init_worker().wait()
+        if self.use_pre_process_policy:
+            self.rollout.init_worker().wait()
+            # self.rollout.offload_engine().wait()
+            self.actor.init_worker().wait()
+        else:
+            self.actor.init_worker().wait()
+            self.rollout.init_worker().wait()
         if self.has_dedicated_inference:
             self.inference.init_worker().wait()
         if self.has_dedicated_reward:
