@@ -464,10 +464,15 @@ class AsyncSGLangWorker(SGLangWorker):
         )
 
         # fix the output_ids to the correct length if the generate was migrated from another rank.
-        orig_input_ids_len = len(completion_info.input_ids_map[unique_id])
-        if len(input_ids) != orig_input_ids_len:
-            assert len(input_ids) > orig_input_ids_len
-            result['output_ids'] = input_ids[orig_input_ids_len:] + result['output_ids']
+        origin_input_ids_len = len(completion_info.input_ids_map[unique_id])
+        if len(input_ids) != origin_input_ids_len:
+            assert len(input_ids) > origin_input_ids_len
+            result['output_ids'] = input_ids[origin_input_ids_len:] + result['output_ids']
+            # TODO. Sometimes len(result['output_ids']) = self._cfg.algorithm.sampling_params.max_new_tokens + 1 for migrate batch.
+            if len(result['output_ids']) > self._cfg.algorithm.sampling_params.max_new_tokens:
+                self.log_info(f"Warning : Migrate data is too long. output_ids_len:{len(result['output_ids'])} is greater than max_new_tokens {self._cfg.algorithm.max_new_tokens}")
+                result['output_ids'] = result['output_ids'][:self._cfg.algorithm.sampling_params.max_new_tokens]
+
 
         completion_info.record_result(unique_id, result)
         if completion_info.is_completed(unique_id):
