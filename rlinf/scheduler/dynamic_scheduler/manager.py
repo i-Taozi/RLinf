@@ -274,7 +274,7 @@ class RolloutManager(ComponentManager):
 
         migrate_out_batches_index = 0
         migrate_out_batches_len = len(migrate_out_batches)
-        self._logger.info(f"[dev-hjh] migrate_out_batches_len: {migrate_out_batches_len}, instance_running_tasks_expected={instance_running_tasks_expected}, instance_running_tasks_expected={instance_running_tasks_expected}")
+        self._logger.info(f"[dev-hjh] migrate_out_batches_len: {migrate_out_batches_len}, running_tasks={self.running_tasks}, instance_running_tasks_expected={instance_running_tasks_expected}")
 
         for instance_id in range(self.current_instance_num):
             rollout_instance_id = instance_id + self.current_instance_offset

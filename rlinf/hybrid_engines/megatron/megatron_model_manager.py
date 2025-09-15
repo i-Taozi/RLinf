@@ -286,6 +286,8 @@ class MegatronModelManager:
     def save_checkpoint(
         self, checkpoint_save_path, step, num_floating_point_operations_so_far=0
     ):
+        if not getattr(self, 'is_running', True):
+            return
         args = get_args()
         args.save = checkpoint_save_path
         save_checkpoint(

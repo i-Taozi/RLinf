@@ -14,7 +14,7 @@
 
 import logging
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import pandas as pd
 import torch
@@ -37,6 +37,7 @@ from rlinf.workers.actor.megatron_actor_worker import MegatronActor
 from rlinf.workers.inference.megatron_inference_worker import MegatronInference
 from rlinf.workers.rollout.sglang.sglang_worker import SGLangWorker
 
+from rlinf.workers.rollout.vllm.vllm_worker import VLLMWorker
 logging.getLogger().setLevel(logging.INFO)
 
 
@@ -49,8 +50,7 @@ class MathRunner:
         placement: ModelParallelComponentPlacement,
         train_dataset: Dataset,
         val_dataset: Dataset,
-        # rollout: Union[SGLangWorker, VLLMWorker],
-        rollout: SGLangWorker,
+        rollout: Union[SGLangWorker, VLLMWorker],
         inference: Optional[MegatronInference],
         actor: MegatronActor,
         reward: Optional[Worker] = None,
