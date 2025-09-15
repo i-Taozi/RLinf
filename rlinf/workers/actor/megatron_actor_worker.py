@@ -14,8 +14,7 @@
 
 import copy
 from functools import partial
-from re import A
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -83,17 +82,20 @@ from rlinf.utils.utils import (
 from rlinf.workers.rollout.utils import RankMapper
 
 try:
+    from params_resharding import resharding_init
+
     from rlinf.scheduler.dynamic_scheduler.utils import (
         get_scheduler_channel,
         get_scheduler_request_queue,
         get_scheduler_response_queue,
         get_valid_dp_sizes,
     )
-    from params_resharding import resharding_init
     HAVE_RESHARDING = True
 except ImportError:
     print("can't find params_resharding, resharding is not supported", flush=True)
     HAVE_RESHARDING = False
+
+
 class MegatronActor(MegatronModelManager, Worker):
     """The class for running the actor training using Megatron."""
 
@@ -153,7 +155,7 @@ class MegatronActor(MegatronModelManager, Worker):
         self.is_weight_offloaded = False
         self.is_optimizer_offloaded = False
         self.ref_policy_state_dict = None
-        self.is_pipeline = self.component_placement.is_disaggregated
+        self.is_pipeline = self.component_placement.is_pipeline
 
         # Reward configurations
         if not self.cfg.reward.use_reward_model:
@@ -194,8 +196,8 @@ class MegatronActor(MegatronModelManager, Worker):
             )
 
         # Create GLOO MP group for broadcast
-        self._mp_group_ranks = parallel_state._MODEL_PARALLEL_GLOBAL_RANKS
-        self._cp_group_ranks = parallel_state._CONTEXT_PARALLEL_GLOBAL_RANKS
+        # self._mp_group_ranks = parallel_state._MODEL_PARALLEL_GLOBAL_RANKS
+        # self._cp_group_ranks = parallel_state._CONTEXT_PARALLEL_GLOBAL_RANKS
 
         self._init_profiler()
 
@@ -315,8 +317,8 @@ class MegatronActor(MegatronModelManager, Worker):
                 result: RolloutResult = channel.get()
             else:
                 result = None
-            result = self.broadcast(result, ranks=self._mp_group_ranks)
-            result = self.broadcast(result, ranks=self._cp_group_ranks)
+            result = self.broadcast(result, ranks=parallel_state._MODEL_PARALLEL_GLOBAL_RANKS)
+            result = self.broadcast(result, ranks=parallel_state._CONTEXT_PARALLEL_GLOBAL_RANKS)
 
         batch = result.to_actor_batch(
             self.cfg.data.max_prompt_length,
@@ -810,14 +812,15 @@ class MegatronActor(MegatronModelManager, Worker):
         # Built iterator for Megatron's pipeline schedule to run
         # NOTE: We cannot iterate over the iterator here, as Megatron's pipeline schedule is responsible for iterating over data
         # As a result, we need to separate the implementation for pipeline and non-pipeline mode for Megatron
+
         train_batch_iterator = BatchResizingIterator(
-            cfg=self.cfg,
-            get_batch_fn=partial(self.get_batch, input_channel),
-            micro_batch_size=self.role_cfg.micro_batch_size,
-            total_batch_size=self.total_batch_size_per_dp,
-            num_global_batches=self.num_train_steps,
-            forward_only=False,
-        )
+                    cfg=self.cfg,
+                    get_batch_fn=partial(self.get_batch, input_channel),
+                    micro_batch_size=self.role_cfg.micro_batch_size,
+                    total_batch_size=self.total_batch_size_per_dp,
+                    num_global_batches=self.num_train_steps,
+                    forward_only=False,
+                )
 
         # Advantage normalization
         assert not self.cfg.algorithm.normalize_advantages, (
@@ -839,9 +842,12 @@ class MegatronActor(MegatronModelManager, Worker):
         # Global batch iterations
         training_metrics_list = []
         for _ in range(self.num_train_steps):
-            training_metrics = self.training_step(train_batch_iterator)
-            train_batch_iterator.check_finished_global_batch()
-            training_metrics_list.append(training_metrics)
+            self.log_info(f'[debug-hjh] iter={_}, is_running={self.is_running}')
+            if self.is_running:
+                train_batch_iterator.reset_total_batch_size(self.total_batch_size_per_dp)
+                training_metrics = self.training_step(train_batch_iterator)
+                train_batch_iterator.check_finished_global_batch()
+                training_metrics_list.append(training_metrics)
             self.scheudler_main_loop()
 
         # Gather weights if overlap_param_gather before the next weight sync
@@ -860,10 +866,11 @@ class MegatronActor(MegatronModelManager, Worker):
         if self._rank == 0:
             if update_state:
                 self.schedule_channel.put(None, queue_name=self.scheduler_response_queue, async_op=True).wait()
-            response = self.schedule_channel.get(queue_name=self.scheduler_request_queue,async_op=True).wait()
+
+            response = self.schedule_channel.get(queue_name=self.scheduler_request_queue, async_op=True).wait()
         else:
             response = None
-        response = self.broadcast_obj(response)
+        return self.broadcast_obj(response)
 
     def scheduler_pre_process(self):
         if not self.use_pre_process_policy:
@@ -891,18 +898,20 @@ class MegatronActor(MegatronModelManager, Worker):
         if not self.use_auto_scheduler:
             return parallel_state.get_data_parallel_group()
 
+        trained_batch_size = get_batch_size(batch)
+
         max_data_parallel_group = parallel_state.get_data_parallel_group_elastic_max()
         max_data_parallel_ranks = torch.distributed.get_process_group_ranks(max_data_parallel_group)
 
         # TODO(Junhao):: 这里判断的条件貌似改了
-        rollout_metrics_dp_ranks_states = torch.tensor([(dp_rank == self._rank and len(batch) > 0) for dp_rank in max_data_parallel_ranks]).cuda()
+        rollout_metrics_dp_ranks_states = torch.tensor([(dp_rank == self._rank and trained_batch_size > 0) for dp_rank in max_data_parallel_ranks]).cuda()
         torch.distributed.all_reduce(rollout_metrics_dp_ranks_states, torch.distributed.ReduceOp.MAX, group=max_data_parallel_group)
 
         rollout_metrics_dp_ranks_states = rollout_metrics_dp_ranks_states.tolist()
         rollout_metrics_valid_dp_ranks = [rank for rank, state in zip(max_data_parallel_ranks, rollout_metrics_dp_ranks_states) if state]
 
         # TODO(Junhao):: 这里判断的条件貌似改了
-        if len(batch) > 0:
+        if trained_batch_size > 0:
             return parallel_state.get_group_by_ranks(rollout_metrics_valid_dp_ranks)
         return None
 
@@ -915,9 +924,14 @@ class MegatronActor(MegatronModelManager, Worker):
                 gbs=self.cfg.actor.global_batch_size,
                 dp=parallel_state.get_data_parallel_world_size(),
             )
-        self.log_info(f"run_training_pipeline: mbs={self.cfg.actor.micro_batch_size}, gbs={self.cfg.actor.global_batch_size}, dp={parallel_state.get_data_parallel_world_size()} {get_num_microbatches()=}")
+        self.total_batch_size_per_dp = (
+            self.cfg.data.rollout_batch_size
+            * self.cfg.algorithm.group_size
+            // parallel_state.get_data_parallel_world_size()
+        )
+        self.log_info(f"run_training_pipeline: mbs={self.cfg.actor.micro_batch_size}, gbs={self.cfg.actor.global_batch_size}, dp={parallel_state.get_data_parallel_world_size()}, self.total_batch_size_per_dp={self.total_batch_size_per_dp}")
 
-    def init_trainer_resharding(self, first_world_size:int = -1):
+    def init_trainer_resharding(self, first_world_size: int = -1):
         """Init resharding func.
         """
         args = get_args()
@@ -935,7 +949,6 @@ class MegatronActor(MegatronModelManager, Worker):
         assert args.world_size == self.component_placement._cluster_num_gpus, "In Auto-Scheduler mode, actor should be initialized on all GPUs."
         assert self.component_placement.actor_world_size < args.world_size
 
-
         valid_dp_sizes = get_valid_dp_sizes(self.cfg, default_model_parallel_size_with_cp)
         assert len(valid_dp_sizes) > 0
         resharding_strategies = []
@@ -946,7 +959,7 @@ class MegatronActor(MegatronModelManager, Worker):
 
             resharding_strategies.append(
                 {
-                    "world_size" : world_size,
+                    "world_size": world_size,
                     "tensor_model_parallel_size": args.tensor_model_parallel_size,
                     "pipeline_model_parallel_size": args.pipeline_model_parallel_size,
                     "context_parallel_size": args.context_parallel_size
@@ -955,20 +968,20 @@ class MegatronActor(MegatronModelManager, Worker):
 
         assert resharding_strategies[0]['world_size'] == args.world_size
 
-        self.trainer_resharding_func : Callable = resharding_init(
-            model = self.model,
-            optimizer = self.optimizer,
-            opt_param_scheduler = self.lr_scheduler,
-            trainer_parallel_strategies = resharding_strategies,
-            offload_frist_strategy = False,
-            model_provider = self.model_provider_func,
+        self.trainer_resharding_func: Callable = resharding_init(
+            model=self.model,
+            optimizer=self.optimizer,
+            opt_param_scheduler=self.lr_scheduler,
+            trainer_parallel_strategies=resharding_strategies,
+            offload_frist_strategy=False,
+            model_provider=self.model_provider_func,
         )
 
         if first_world_size == -1:
             first_world_size = self.component_placement.actor_world_size
 
         self.is_running = True
-        self.apply_parallel_strategy({'world_size':first_world_size})
+        self.apply_parallel_strategy({'world_size': first_world_size})
 
     def apply_parallel_strategy(self, parallel_strategy):
         """Apply specified training parallel strategy
@@ -1002,11 +1015,12 @@ class MegatronActor(MegatronModelManager, Worker):
     def broadcast_obj(self, obj):
         parallel_state.barrier_with_gloo()
         device = torch.cuda.current_device()
+
         if self._rank == 0:
-            torch.distributed.broadcast_object_list([obj], src=0, device=device)
+            torch.distributed.broadcast_object_list([obj], src=0, device=device, group=torch.distributed.GroupMember.WORLD)
         else:
             obj_list = [None]
-            torch.distributed.broadcast_object_list(obj_list, src=0, device=device)
+            torch.distributed.broadcast_object_list(obj_list, src=0, device=device, group=torch.distributed.GroupMember.WORLD)
             obj = obj_list[0]
         return obj
 
@@ -1258,7 +1272,7 @@ class MegatronActor(MegatronModelManager, Worker):
                     weight_dst_rank,
                 )
         else:
-            assert self.component_placement._placement_mode ==  PlacementMode.AUTO, "Unsupported placement mode for sending weights."
+            assert self.component_placement._placement_mode == PlacementMode.AUTO, "Unsupported placement mode for sending weights."
             if self.offload_optimizer:
                 self.offload_megatron_optimizer()
                 self.is_optimizer_offloaded = True

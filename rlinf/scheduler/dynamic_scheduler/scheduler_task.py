@@ -53,6 +53,7 @@ class SchedulerTask(Worker):
 
         # Get valid dp size list for actor
         self.actor_valid_dp_sizes = get_valid_dp_sizes(self.cfg, self.actor_model_parallel_size)
+        self.log_info(f"[debug-hjh] self.actor_valid_dp_sizes={self.actor_valid_dp_sizes}")
 
         # Create ComponentManager for each component
         self.rollout_manager = RolloutManager(
@@ -133,9 +134,8 @@ class SchedulerTask(Worker):
         """
         for train_iter in range(self.cfg.algorithm.n_minibatches):
             # Wait for actor ready to update
-            self.log_info(f"[debug-hjh] train_iter={train_iter} start wait_for_actor_update()")
+
             await self.actor_manager.wait_for_actor_update()
-            self.log_info(f"[debug-hjh] train_iter={train_iter} finish wait_for_actor_update()")
 
             # Trying to release the resource of rollout and inference
             rollout_released_gpu_num = await self.rollout_manager.release_resource(

@@ -14,10 +14,9 @@
 
 import logging
 import os
-from typing import Dict, Optional, Union
+from typing import Dict, Optional
 
 import pandas as pd
-from rlinf.scheduler.dynamic_scheduler.scheduler_task import SchedulerTask
 import torch
 from omegaconf.dictconfig import DictConfig
 from torch.utils.data import Dataset, RandomSampler, SequentialSampler
@@ -27,6 +26,7 @@ from tqdm import tqdm
 from rlinf.data.io_struct import RolloutRequest
 from rlinf.scheduler import Channel, Worker
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
+from rlinf.scheduler.dynamic_scheduler.scheduler_task import SchedulerTask
 from rlinf.utils.data_iter_utils import split_list
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.metric_logger import MetricLogger
@@ -36,7 +36,6 @@ from rlinf.utils.timers import Timer
 from rlinf.workers.actor.megatron_actor_worker import MegatronActor
 from rlinf.workers.inference.megatron_inference_worker import MegatronInference
 from rlinf.workers.rollout.sglang.sglang_worker import SGLangWorker
-from rlinf.workers.rollout.vllm.vllm_worker import VLLMWorker
 
 logging.getLogger().setLevel(logging.INFO)
 
@@ -50,16 +49,17 @@ class MathRunner:
         placement: ModelParallelComponentPlacement,
         train_dataset: Dataset,
         val_dataset: Dataset,
-        rollout: Union[SGLangWorker, VLLMWorker],
+        # rollout: Union[SGLangWorker, VLLMWorker],
+        rollout: SGLangWorker,
         inference: Optional[MegatronInference],
         actor: MegatronActor,
         reward: Optional[Worker] = None,
-        scheduler_task : SchedulerTask = None,
+        scheduler_task: SchedulerTask = None,
     ):
         """"""
         self.cfg = cfg
         self.component_placement = placement
-        self.is_pipeline = self.component_placement.is_disaggregated
+        self.is_pipeline = self.component_placement.is_pipeline
         self.has_dedicated_inference = inference is not None
         self.has_dedicated_reward = reward is not None
 
@@ -180,7 +180,7 @@ class MathRunner:
         # Init workers
         if self.use_pre_process_policy:
             self.rollout.init_worker().wait()
-            # self.rollout.offload_engine().wait()
+            self.rollout.offload_engine().wait()
             self.actor.init_worker().wait()
         else:
             self.actor.init_worker().wait()
@@ -298,13 +298,13 @@ class MathRunner:
             self.dataloader_channel.put(request, async_op=True)
 
     def _sync_weights(self):
-        self.actor.sync_model_to_rollout()
-        self.rollout.sync_model_from_actor().wait()
-        self.actor.del_reshard_state_dict().wait()
-
         if self.has_dedicated_inference:
             self.actor.sync_model_to_inference()
             self.inference.sync_model_from_actor().wait()
+
+        self.actor.sync_model_to_rollout()
+        self.rollout.sync_model_from_actor().wait()
+        self.actor.del_reshard_state_dict().wait()
 
     def run(self):
         epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)
@@ -328,6 +328,9 @@ class MathRunner:
 
                     with self.timer("sync_weights"):
                         self._sync_weights()
+
+                    if self.scheduler_task is not None:
+                        scheduler_handle = self.scheduler_task.run()
 
                     # Rollout
                     rollout_handle: Handle = self.rollout.rollout(
@@ -370,6 +373,9 @@ class MathRunner:
                     )
 
                     metrics = actor_handle.wait()
+
+                    if self.scheduler_task is not None:
+                        scheduler_handle.wait()
                     self.global_steps += 1
 
                     run_time_exceeded = self.run_timer.is_finished()

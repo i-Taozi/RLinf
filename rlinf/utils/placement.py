@@ -318,7 +318,7 @@ class ModelParallelComponentPlacement(ComponentPlacement):
                 self._placements["inference"] = PackedPlacementStrategy(
                     self._inference_gpus[0], self._inference_gpus[-1]
                 )
-            if self._placement_mode  == PlacementMode.DISAGGREGATED:
+            if self._placement_mode == PlacementMode.DISAGGREGATED:
                 self._placements["actor"] = PackedPlacementStrategy(
                     self._actor_gpus[0], self._actor_gpus[-1]
                 )
@@ -327,15 +327,18 @@ class ModelParallelComponentPlacement(ComponentPlacement):
                     0, self._cluster_num_gpus - 1
                 )
 
-
     @property
     def is_disaggregated(self):
         return self._placement_mode == PlacementMode.DISAGGREGATED
 
     @property
+    def is_pipeline(self):
+        return self.is_disaggregated or self._placement_mode == PlacementMode.AUTO
+
+    @property
     def has_dedicated_inference(self):
         return (
-            self._placement_mode == PlacementMode.DISAGGREGATED
+            self._placement_mode in [PlacementMode.DISAGGREGATED, PlacementMode.AUTO]
             and self._inference_gpus is not None
         )
 

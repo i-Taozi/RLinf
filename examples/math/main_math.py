@@ -66,7 +66,7 @@ def main(cfg) -> None:
     # Inference group
     inference_group = None
     if (
-        component_placement.placement_mode == PlacementMode.DISAGGREGATED
+        component_placement.placement_mode in [PlacementMode.DISAGGREGATED, PlacementMode.AUTO]
         and cfg.algorithm.recompute_logprobs
     ):
         inference_placement_strategy = component_placement.get_strategy("inference")

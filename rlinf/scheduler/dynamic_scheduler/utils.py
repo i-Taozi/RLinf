@@ -71,7 +71,8 @@ class RolloutAction(Enum):
     Migrate_In = auto()         # Abort running tasks
     Migrate_Out = auto()        # Recevie running tasks
     Finish = auto()             # Finish running taks => offload weight
-    Wait_For_Finish = auto()    # block by rollout
+    Wait_For_Finish = auto()    # Block by rollout
+    Offloaded = auto()          # Rollout offloaded signal
 
 
 @dataclass

@@ -164,7 +164,7 @@ class RolloutManager(ComponentManager):
             assert (
                 response.instance_id == rollout_instance_id
                 and response.report is not None
-            )
+            ), f"rollout_instance_id={rollout_instance_id}, response={response}"
             self.reports[instance_id] = response.report
 
         total_tasks = sum(report.total_tasks for report in self.reports)
@@ -182,7 +182,7 @@ class RolloutManager(ComponentManager):
 
     async def offload(self, action: RolloutAction) -> int:
         assert action in [RolloutAction.Finish, RolloutAction.Wait_For_Finish]
-
+        offloaded_instance_ids = []
         for instance_id in range(self.current_instance_num):
             rollout_instance_id = instance_id + self.current_instance_offset
             await self.channel.put(
@@ -191,9 +191,20 @@ class RolloutManager(ComponentManager):
                 async_op=True,
             ).async_wait()
 
+            offloaded_instance_ids.append(rollout_instance_id)
+
         released_instance_num = self.current_instance_num
         self.release(release_instance_num=released_instance_num)
         assert self.current_gpu_num == 0
+
+        assert len(offloaded_instance_ids) == released_instance_num
+        for rollout_instance_id in offloaded_instance_ids:
+            response = await self.channel.get(
+                queue_name=get_scheduler_response_queue(rollout_instance_id),
+                async_op=True,
+            ).async_wait()
+            assert response.action == RolloutAction.Offloaded and response.instance_id == rollout_instance_id
+
         return released_instance_num * self.model_parallel_size
 
     async def migrate_policy(self, train_iter: int) -> int:
@@ -232,6 +243,7 @@ class RolloutManager(ComponentManager):
         assert migrate_instance_num < self.current_instance_num
         assert len(self.reports) == self.current_instance_num
 
+        offloaded_instance_ids = []
         # Migrate_Out
         migrate_out_batches = []
         for instance_id in range(migrate_instance_num):
@@ -252,14 +264,17 @@ class RolloutManager(ComponentManager):
             )
             migrate_out_batches += response.data
 
+            offloaded_instance_ids.append(rollout_instance_id)
+
         self.release(release_instance_num=migrate_instance_num)
 
+        # migrate_out_running_tasks = sum(batch.get_running_tasks() for batch in migrate_out_batches)
         instance_running_tasks_expected = self.running_tasks // self.current_instance_num
         # assert instance_running_tasks_expected > 0
 
         migrate_out_batches_index = 0
         migrate_out_batches_len = len(migrate_out_batches)
-        self._logger.info(f"[dev-hjh] migrate_out_batches_len: {migrate_out_batches_len}, total_running_tasks={self.running_tasks}, instance_running_tasks_expected={instance_running_tasks_expected}")
+        self._logger.info(f"[dev-hjh] migrate_out_batches_len: {migrate_out_batches_len}, instance_running_tasks_expected={instance_running_tasks_expected}, instance_running_tasks_expected={instance_running_tasks_expected}")
 
         for instance_id in range(self.current_instance_num):
             rollout_instance_id = instance_id + self.current_instance_offset
@@ -296,6 +311,15 @@ class RolloutManager(ComponentManager):
                     async_op=True,
                 ).async_wait()
         assert migrate_out_batches_index == migrate_out_batches_len
+
+        # wait before migrate out instance is offloaded
+        assert len(offloaded_instance_ids) == migrate_instance_num
+        for rollout_instance_id in offloaded_instance_ids:
+            response = await self.channel.get(
+                queue_name=get_scheduler_response_queue(rollout_instance_id),
+                async_op=True,
+            ).async_wait()
+            assert response.action == RolloutAction.Offloaded and response.instance_id == rollout_instance_id
 
     async def find_release_instance_num_needed(self, release_instance_num_max: int, actor_valid_dp_sizes: List[int], actor_model_parallel_size: int, actor_current_instance_num: int) -> int:
         if release_instance_num_max == 0:
@@ -481,4 +505,6 @@ class ActorManager(ComponentManager):
             await self.channel.put(None, queue_name=get_scheduler_request_queue(), async_op=True).async_wait()
 
     async def wait_for_actor_update(self):
+        # self._logger.info(f"[debug-hjh] start wait_for_actor_update(), queue_name={get_scheduler_response_queue()}")
         await self.channel.get(queue_name=get_scheduler_response_queue(), async_op=True).async_wait()
+        # self._logger.info(f"[debug-hjh] finish wait_for_actor_update()")
