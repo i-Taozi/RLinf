@@ -15,6 +15,7 @@
 import multiprocessing
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from threading import BoundedSemaphore
 from typing import List, Union
 
 import regex
@@ -23,9 +24,10 @@ from sympy import N, simplify
 from sympy.parsing.latex import parse_latex
 from sympy.parsing.sympy_parser import parse_expr
 
-from rlinf.algorithms.math.verifier.parser import extract_answer
+from .parser import extract_answer
 
 global_executor = ProcessPoolExecutor(max_workers=40)
+global_executor_semaphore = BoundedSemaphore(1)
 
 
 def choice_answer_clean(pred: str):
@@ -394,28 +396,30 @@ def math_verify_call(
     )
 
     all_jobs = []
-    for solutions, gen in zip(references, responses):
-        jobs = []
-        for sol in solutions:
-            job = global_executor.submit(verify_math_solution, gen, sol)
-            jobs.append(job)
-        all_jobs.append(jobs)
+    with global_executor_semaphore:
+        # print(f"{global_executor_semaphore._value} slots left in the semaphore")
+        for solutions, gen in zip(references, responses):
+            jobs = []
+            for sol in solutions:
+                job = global_executor.submit(verify_math_solution, gen, sol)
+                jobs.append(job)
+            all_jobs.append(jobs)
 
-    labels = []
-    has_timeout = False
-    for jobs in all_jobs:
-        label = 0
-        try:
-            for job in as_completed(jobs, timeout=timeout):
-                x = job.result()
-                label = label or x
-        except TimeoutError:
-            has_timeout = True
-        labels.append(label)
+        labels = []
+        has_timeout = False
+        for jobs in all_jobs:
+            label = 0
+            try:
+                for job in as_completed(jobs, timeout=timeout):
+                    x = job.result()
+                    label = label or x
+            except TimeoutError:
+                has_timeout = True
+            labels.append(label)
 
-    if has_timeout:
-        reset_global_process_pool()
-    return labels
+        if has_timeout:
+            reset_global_process_pool()
+        return labels
 
 
 class MathRewardModel:
