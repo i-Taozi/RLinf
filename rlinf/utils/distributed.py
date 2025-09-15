@@ -41,63 +41,49 @@ def compute_rollout_metrics(
     reward_scores = rollout_batch["rewards"].clone().to(device=device)
     is_end = rollout_batch["is_end"].clone().float().to(device=device)
 
-    dp_world_size = torch.distributed.get_world_size(group=data_parallel_group)
+    dp_world_size = torch.distributed.get_world_size(data_parallel_group)
 
-    prompt_lengths_list = [
-        torch.empty_like(prompt_lengths) for _ in range(dp_world_size)
-    ]
-    decode_lengths_list = [
-        torch.empty_like(response_lengths) for _ in range(dp_world_size)
-    ]
-    torch.distributed.all_gather(
+    prompt_lengths_list: List[List[int]] = [None for _ in range(dp_world_size)]
+    decode_lengths_list: List[List[int]] = [None for _ in range(dp_world_size)]
+    torch.distributed.all_gather_object(
         prompt_lengths_list,
-        prompt_lengths,
+        prompt_lengths.tolist(),
         group=data_parallel_group,
     )
-    torch.distributed.all_gather(
+    torch.distributed.all_gather_object(
         decode_lengths_list,
-        response_lengths,
+        response_lengths.tolist(),
         group=data_parallel_group,
     )
 
-    total_prompt_lengths = torch.cat(prompt_lengths_list, dim=0)
-    total_decode_lengths = torch.cat(decode_lengths_list, dim=0)
+    total_prompt_lengths = torch.tensor(sum(prompt_lengths_list, []), device=device)
+    total_decode_lengths = torch.tensor(sum(decode_lengths_list, []), device=device)
 
-    torch.distributed.all_reduce(
-        prompt_lengths,
-        torch.distributed.ReduceOp.AVG,
-        group=data_parallel_group,
-    )
-    torch.distributed.all_reduce(
-        response_lengths,
-        torch.distributed.ReduceOp.AVG,
-        group=data_parallel_group,
-    )
-    torch.distributed.all_reduce(
-        reward_scores,
-        torch.distributed.ReduceOp.AVG,
-        group=data_parallel_group,
-    )
-    torch.distributed.all_reduce(
-        is_end,
-        torch.distributed.ReduceOp.AVG,
-        group=data_parallel_group,
-    )
+    sum_plen = prompt_lengths.sum().detach().item()
+    sum_rlen = response_lengths.sum().detach().item()
+    sum_rewards = reward_scores.sum().detach().item()
+    sum_end = is_end.sum().detach().item()
 
     valid_adv = torch.masked_select(advantages, mask)
-    n_valid_token = mask.sum()
-    adv_sum = valid_adv.to(torch.float64).sum()
+    n_valid_token = mask.sum().detach().item()
+    sum_adv = valid_adv.to(torch.float64).sum().detach().item()
+
+    num_seq = prompt_lengths.numel()
+    reduce_metrics = torch.as_tensor(
+        [sum_plen, sum_rlen, sum_rewards, sum_end, sum_adv, num_seq, n_valid_token],
+        device=device,
+        dtype=torch.float32,
+    )
+
     torch.distributed.all_reduce(
-        n_valid_token,
-        op=torch.distributed.ReduceOp.SUM,
+        reduce_metrics,
+        torch.distributed.ReduceOp.SUM,
         group=data_parallel_group,
     )
-    torch.distributed.all_reduce(
-        adv_sum,
-        op=torch.distributed.ReduceOp.SUM,
-        group=data_parallel_group,
+
+    sum_plen, sum_rlen, sum_rewards, sum_end, sum_adv, num_seq, n_valid_token = (
+        reduce_metrics.tolist()
     )
-    adv_mean = adv_sum / n_valid_token
 
     adv_max = torch.max(valid_adv).detach().item()
     adv_min = torch.min(valid_adv).detach().item()
@@ -106,19 +92,19 @@ def compute_rollout_metrics(
     )
     torch.distributed.all_reduce(
         reduce_tensor,
-        torch.distributed.ReduceOp.MAX,
+    torch.distributed.ReduceOp.MAX,
         group=data_parallel_group,
     )
     adv_min, adv_max = reduce_tensor.tolist()
 
     rollout_metrics = {
-        "batch_size_per_dp": prompt_lengths.size(0),
-        "prompt_length": prompt_lengths.float().mean().item(),
-        "response_length": response_lengths.float().mean().item(),
-        "total_length": (response_lengths + prompt_lengths).float().mean().item(),
-        "reward_scores": reward_scores.mean().item(),
-        "fraction_of_samples_properly_ended": is_end.mean().item(),
-        "advantages_mean": adv_mean.detach().item(),
+        "total_num_sequence": num_seq,
+        "prompt_length": sum_plen / num_seq,
+        "response_length": sum_rlen / num_seq,
+        "total_length": (sum_plen + sum_rlen) / num_seq,
+        "rewards": sum_rewards / num_seq,
+        "fraction_of_samples_properly_ended": sum_end / num_seq,
+        "advantages_mean": sum_adv / n_valid_token,
         "advantages_max": adv_max,
         "advantages_min": -adv_min,
     }
