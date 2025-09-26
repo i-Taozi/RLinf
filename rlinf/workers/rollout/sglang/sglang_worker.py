@@ -509,19 +509,12 @@ class AsyncSGLangWorker(SGLangWorker):
         completion_info.record_result(unique_id, result)
         if completion_info.is_completed(unique_id):
             orig_input_ids, answer, results = completion_info.pop_results(unique_id)
-            try:
-                async with asyncio.timeout(100):
-                    rewards, advantages = await asyncio.to_thread(
-                        self._compute_reward_and_advantage,
-                        results,
-                        answer,
-                    )
-            except TimeoutError:
-                self.log_info(
-                    f"Timeout when calculating reward and advantage for unique_id={unique_id}. Using zero rewards and advantages."
-                )
-                rewards = [-1.0] * len(results)
-                advantages = [0.0] * len(results)
+
+            rewards, advantages = await asyncio.to_thread(
+                self._compute_reward_and_advantage,
+                results,
+                answer,
+            )
 
             rollout_result = RolloutResult.from_sglang_results(
                 results,
@@ -529,9 +522,9 @@ class AsyncSGLangWorker(SGLangWorker):
                 [orig_input_ids] * len(results),
                 return_logprobs=self._return_logprobs,
             )
-            rollout_result.rewards = torch.tensor(
-                rewards, dtype=torch.float32
-            ).reshape(-1, 1)
+            rollout_result.rewards = torch.tensor(rewards, dtype=torch.float32).reshape(
+                -1, 1
+            )
             rollout_result.advantages = advantages
 
             return result, rollout_result

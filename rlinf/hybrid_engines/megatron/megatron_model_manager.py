@@ -586,12 +586,12 @@ class MegatronModelManager:
             for v in _opt.optimizer.state.values():
                 if "exp_avg" in v:
                     v["exp_avg"].data = v["exp_avg"].cpu_data.to(
-                        torch.cuda.current_device(), non_blocking=True
+                        torch.cuda.current_device(), non_blocking=False
                     )
                     v["exp_avg"].cpu_data = None
                 if "exp_avg_sq" in v:
                     v["exp_avg_sq"].data = v["exp_avg_sq"].cpu_data.to(
-                        torch.cuda.current_device(), non_blocking=True
+                        torch.cuda.current_device(), non_blocking=False
                     )
                     v["exp_avg_sq"].cpu_data = None
         clear_memory()

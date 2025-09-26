@@ -102,7 +102,7 @@ def compute_rollout_metrics(
         "prompt_length": sum_plen / num_seq,
         "response_length": sum_rlen / num_seq,
         "total_length": (sum_plen + sum_rlen) / num_seq,
-        "rewards": sum_rewards / num_seq,
+        "reward_scores": sum_rewards / num_seq,
         "fraction_of_samples_properly_ended": sum_end / num_seq,
         "advantages_mean": sum_adv / n_valid_token,
         "advantages_max": adv_max,

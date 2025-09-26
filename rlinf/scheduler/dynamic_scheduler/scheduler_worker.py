@@ -39,6 +39,13 @@ class SchedulerWorker(Worker):
         self.components = self.component_placement._components
         self.total_gpus = self.component_placement._cluster_num_gpus
 
+        assert self.cfg.rollout.rollout_backend == "sglang", (
+            "only sglang is supported for dynamic scheduler"
+        )
+        assert self.cfg.actor.training_backend == "megatron", (
+            "only megatron is supported for dynamic scheduler"
+        )
+
         # Set policies for scheduler
         self.use_pre_process_policy = getattr(
             self.cfg.cluster, "use_pre_process_policy", True

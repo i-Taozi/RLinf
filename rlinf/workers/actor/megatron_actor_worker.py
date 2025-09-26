@@ -921,9 +921,10 @@ class MegatronActor(MegatronModelManager, Worker):
             * self.cfg.algorithm.group_size
             // parallel_state.get_data_parallel_world_size()
         )
-        self.log_info(
-            f"run_training_pipeline: mbs={self.cfg.actor.micro_batch_size}, gbs={self.cfg.actor.global_batch_size}, dp={parallel_state.get_data_parallel_world_size()}, self.total_batch_size_per_dp={self.total_batch_size_per_dp}"
-        )
+        if self._rank == 0:
+            self.log_info(
+                f"run_training_pipeline: mbs={self.cfg.actor.micro_batch_size}, gbs={self.cfg.actor.global_batch_size}, dp={parallel_state.get_data_parallel_world_size()}, self.total_batch_size_per_dp={self.total_batch_size_per_dp}"
+            )
 
     def init_trainer_resharding(self, first_world_size: int = -1):
         """Init resharding func."""
@@ -990,6 +991,14 @@ class MegatronActor(MegatronModelManager, Worker):
 
     def apply_parallel_strategy(self, parallel_strategy):
         """Apply specified training parallel strategy"""
+
+        from megatron.core import __version__ as megatron_version
+        from packaging import version
+
+        assert version.parse(megatron_version).minor == 11, (
+            "only megatron 0.11 is supported for online-resharding now"
+        )
+
         args = get_args()
         args.load = None
 
