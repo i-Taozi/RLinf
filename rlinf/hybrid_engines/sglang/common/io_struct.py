@@ -43,26 +43,6 @@ class TaskMethodOutput:
 
 
 @dataclass
-class OffloadReqInput:
-    pass
-
-
-@dataclass
-class OffloadReqOutput:
-    pass
-
-
-@dataclass
-class SyncWeightInput:
-    pass
-
-
-@dataclass
-class SyncWeightOutput:
-    pass
-
-
-@dataclass
 class SyncHFWeightInput:
     pass
 
