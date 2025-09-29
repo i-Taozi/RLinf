@@ -17,13 +17,12 @@ from enum import Enum, auto
 from typing import List
 
 
-def get_valid_dp_sizes(cfg, model_parallel_size_with_cp) -> List[int]:
+def get_valid_dp_sizes(cfg, total_gpus, model_parallel_size_with_cp) -> List[int]:
     """This function is used to get the valid data parallel sizes for the Actor based on the constraints of batch and group size.
 
     Returns:
         List[int]: The valid data parallel sizes for the component.
     """
-    total_gpus = cfg.cluster.num_gpus_per_node * cfg.cluster.num_nodes
     group_size = cfg.algorithm.group_size
     n_minibatches = cfg.algorithm.n_minibatches
     rollout_batch_size = cfg.data.rollout_batch_size

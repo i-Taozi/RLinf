@@ -195,10 +195,6 @@ class MegatronActor(MegatronModelManager, Worker):
                 "Dynamic batch size is not supported in pipeline mode."
             )
 
-        # Create GLOO MP group for broadcast
-        # self._mp_group_ranks = parallel_state._MODEL_PARALLEL_GLOBAL_RANKS
-        # self._cp_group_ranks = parallel_state._CONTEXT_PARALLEL_GLOBAL_RANKS
-
         self._init_profiler()
 
         self.use_auto_scheduler = (
@@ -208,7 +204,7 @@ class MegatronActor(MegatronModelManager, Worker):
             getattr(self.cfg.cluster, "use_pre_process_policy", False)
             and self.use_auto_scheduler
         )
-        self.is_running = True
+
         if self.use_auto_scheduler:
             assert HAVE_RESHARDING, "params_resharding is required for scheduler"
             self.schedule_channel = self.connect_channel(get_scheduler_channel(role))
@@ -954,7 +950,7 @@ class MegatronActor(MegatronModelManager, Worker):
         assert self.component_placement.actor_world_size < args.world_size
 
         valid_dp_sizes = get_valid_dp_sizes(
-            self.cfg, default_model_parallel_size_with_cp
+            self.cfg, self.component_placement._cluster_num_gpus, default_model_parallel_size_with_cp
         )
         assert len(valid_dp_sizes) > 0
         resharding_strategies = []
@@ -981,6 +977,7 @@ class MegatronActor(MegatronModelManager, Worker):
             trainer_parallel_strategies=resharding_strategies,
             offload_frist_strategy=False,
             model_provider=self.model_provider_func,
+            _logger=self._logger
         )
 
         if first_world_size == -1:
@@ -1027,7 +1024,7 @@ class MegatronActor(MegatronModelManager, Worker):
                 ]
 
         if self._rank == 0:
-            self._logger.info(
+            self.log_info(
                 f"[ElasticMegatron-Info] start resharing with new_parallel_strategy = {new_parallel_strategy}"
             )
         training_states, _ = self.trainer_resharding_func(

@@ -262,7 +262,29 @@ class ModelParallelComponentPlacement(ComponentPlacement):
         )
 
     def _is_auto(self):
-        return getattr(self._config.cluster, "auto_scheduler", False)
+        if not getattr(self._config.cluster, "auto_scheduler", False):
+            return False
+
+        assert self._is_disaggregated(), (
+            "AUTO mode is a more advanced version of disaggregated mode, so it must satisfy the requirements of disaggregated mode."
+        )
+
+        # Assert components order is : actor -> rollout -> inference
+        order_error_msg = "AUTO mode requires components to be placed in the order of actor -> rollout -> inference."
+        assert (
+            self._actor_gpus[0] == 0
+            and self._actor_gpus[-1] == self._rollout_gpus[0] - 1
+        ), order_error_msg
+        if self._inference_gpus is None:
+            assert self._rollout_gpus[-1] == self._cluster_num_gpus - 1, order_error_msg
+        else:
+            assert self._rollout_gpus[-1] == self._inference_gpus[0] - 1, (
+                order_error_msg
+            )
+            assert self._inference_gpus[-1] == self._cluster_num_gpus - 1, (
+                order_error_msg
+            )
+        return True
 
     def _is_collocated(self):
         if self._actor_gpus == self._rollout_gpus:
@@ -316,10 +338,7 @@ class ModelParallelComponentPlacement(ComponentPlacement):
             self._placements["actor"] = PackedPlacementStrategy(
                 self._actor_gpus[0], self._actor_gpus[-1]
             )
-        else:
-            assert self._placement_mode == PlacementMode.AUTO, (
-                f"Placement mode {self._placement_mode} is not supported in auto mode"
-            )
+        elif self._placement_mode == PlacementMode.AUTO:
             # In AUTO mode, actor will be placed on all GPUs
             self._placements["actor"] = PackedPlacementStrategy(
                 0, self._cluster_num_gpus - 1
@@ -338,7 +357,7 @@ class ModelParallelComponentPlacement(ComponentPlacement):
             self._placements["rollout"] = PackedPlacementStrategy(
                 self._rollout_gpus[0],
                 self._rollout_gpus[-1],
-                num_gpus_per_process=num_gpus_per_rollout_dp,
+                num_accelerators_per_process=num_gpus_per_rollout_dp,
             )
 
             if self._inference_gpus is not None:

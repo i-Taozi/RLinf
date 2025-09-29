@@ -135,6 +135,8 @@ class MegatronModelManager:
         config = build_config(ModelConfig, cfg.model)
         self.flops_calculator = FLOPSCalculator(config)
 
+        self.is_running = True
+
     def setup_model_and_optimizer(self, model_type=ModelType.encoder_or_decoder):
         """Setup model and optimizer."""
         set_megatron_args(self._cfg)
@@ -286,7 +288,7 @@ class MegatronModelManager:
     def save_checkpoint(
         self, checkpoint_save_path, step, num_floating_point_operations_so_far=0
     ):
-        if not getattr(self, "is_running", True):
+        if not self.is_running:
             return
         args = get_args()
         args.save = checkpoint_save_path
@@ -565,6 +567,7 @@ class MegatronModelManager:
         for _opt in _iter_opts(self.optimizer):
             self.offload_megatron_copy_params(_opt)
             for v in _opt.optimizer.state.values():
+                # Offloading through resetting the storage size can ensure that the tensor can be offloaded correctly even when it has tensor views.
                 if "exp_avg" in v:
                     buffer = v["exp_avg"]
                     buffer.cpu_data = buffer.data.cpu().pin_memory()

@@ -57,7 +57,7 @@ class MathRunner:
         inference: Optional[MegatronInference],
         actor: MegatronActor,
         reward: Optional[Worker] = None,
-        scheduler_task: SchedulerWorker = None,
+        scheduler: SchedulerWorker = None,
     ):
         """"""
         self.cfg = cfg
@@ -74,10 +74,10 @@ class MathRunner:
         self.reward = reward if self.has_dedicated_reward else self.actor
 
         # Scheduler task
-        self.scheduler_task = scheduler_task
-        self.use_pre_process_policy = getattr(
+        self.scheduler = scheduler
+        self.use_pre_process_policy = (scheduler is not None) and getattr(
             self.cfg.cluster, "use_pre_process_policy", False
-        ) and (scheduler_task is not None)
+        )
 
         # Data channels
         self.dataloader_channel = Channel.create("DataLoader")
@@ -335,8 +335,8 @@ class MathRunner:
                     with self.timer("sync_weights"):
                         self._sync_weights()
 
-                    if self.scheduler_task is not None:
-                        scheduler_handle = self.scheduler_task.run()
+                    if self.scheduler is not None:
+                        scheduler_handle = self.scheduler.run()
 
                     # Rollout
                     rollout_handle: Handle = self.rollout.rollout(
@@ -380,7 +380,7 @@ class MathRunner:
 
                     metrics = actor_handle.wait()
 
-                    if self.scheduler_task is not None:
+                    if self.scheduler is not None:
                         scheduler_handle.wait()
                     self.global_steps += 1
 

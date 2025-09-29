@@ -22,7 +22,7 @@ from rlinf.config import validate_cfg
 from rlinf.data.datasets import create_rl_dataset
 from rlinf.data.tokenizers import hf_tokenizer
 from rlinf.runners.math_runner import MathRunner
-from rlinf.scheduler import Cluster, PackedPlacementStrategy
+from rlinf.scheduler import Cluster, NodePlacementStrategy
 from rlinf.scheduler.dynamic_scheduler.scheduler_worker import SchedulerWorker
 from rlinf.utils.placement import ModelParallelComponentPlacement, PlacementMode
 from rlinf.utils.utils import output_redirector
@@ -77,16 +77,14 @@ def main(cfg) -> None:
 
     # Dynamic Scheduler group
     if component_placement._placement_mode == PlacementMode.AUTO:
-        scheduler_placement_strategy = PackedPlacementStrategy(
-            start_gpu_id=0, end_gpu_id=0
-        )
-        scheduler_task = SchedulerWorker.create_group(cfg, component_placement).launch(
+        scheduler_placement_strategy = NodePlacementStrategy([0])
+        scheduler = SchedulerWorker.create_group(cfg, component_placement).launch(
             cluster=cluster,
-            name="SchedulerWorker",
+            name="DynamicScheduler",
             placement_strategy=scheduler_placement_strategy,
         )
     else:
-        scheduler_task = None
+        scheduler = None
 
     tokenizer = hf_tokenizer(cfg.actor.tokenizer.tokenizer_model)
     train_ds, val_ds = create_rl_dataset(cfg.data, tokenizer)
@@ -99,7 +97,7 @@ def main(cfg) -> None:
         rollout=rollout_group,
         inference=inference_group,
         actor=actor_group,
-        scheduler_task=scheduler_task,
+        scheduler=scheduler,
     )
 
     runner.init_workers()

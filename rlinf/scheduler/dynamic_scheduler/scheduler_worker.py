@@ -86,7 +86,7 @@ class SchedulerWorker(Worker):
 
         # Get valid dp size list for actor
         self.actor_valid_dp_sizes = get_valid_dp_sizes(
-            self.cfg, self.actor_model_parallel_size
+            self.cfg, self.component_placement._cluster_num_gpus, self.actor_model_parallel_size
         )
 
         # Create ComponentManager for each component
