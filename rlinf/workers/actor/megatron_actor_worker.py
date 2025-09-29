@@ -88,13 +88,6 @@ from rlinf.utils.utils import (
 from rlinf.workers.rollout.utils import RankMapper
 from toolkits.math_verifier.verify import math_verify_call
 
-try:
-    from params_resharding import resharding_init
-
-    HAVE_RESHARDING = True
-except ImportError:
-    HAVE_RESHARDING = False
-
 
 class MegatronActor(MegatronModelManager, Worker):
     """The class for running the actor training using Megatron."""
@@ -206,7 +199,6 @@ class MegatronActor(MegatronModelManager, Worker):
         )
 
         if self.use_auto_scheduler:
-            assert HAVE_RESHARDING, "params_resharding is required for scheduler"
             self.schedule_channel = self.connect_channel(get_scheduler_channel(role))
             self.scheduler_request_queue = get_scheduler_request_queue(self._rank)
             self.scheduler_response_queue = get_scheduler_response_queue(self._rank)
@@ -924,6 +916,21 @@ class MegatronActor(MegatronModelManager, Worker):
 
     def init_trainer_resharding(self, first_world_size: int = -1):
         """Init resharding func."""
+        try:
+            from params_resharding import resharding_init
+        except ImportError as e:
+            self._logger.error(
+                "params_resharding is not installed, resharding is not supported"
+            )
+            raise e
+
+        from megatron.core import __version__ as megatron_version
+        from packaging import version
+
+        assert version.parse(megatron_version).minor == 11, (
+            "only megatron 0.11 is supported for online-resharding now"
+        )
+
         args = get_args()
         args.rank = torch.distributed.get_rank()
         args.world_size = torch.distributed.get_world_size()
@@ -950,7 +957,9 @@ class MegatronActor(MegatronModelManager, Worker):
         assert self.component_placement.actor_world_size < args.world_size
 
         valid_dp_sizes = get_valid_dp_sizes(
-            self.cfg, self.component_placement._cluster_num_gpus, default_model_parallel_size_with_cp
+            self.cfg,
+            self.component_placement._cluster_num_gpus,
+            default_model_parallel_size_with_cp,
         )
         assert len(valid_dp_sizes) > 0
         resharding_strategies = []
@@ -977,7 +986,7 @@ class MegatronActor(MegatronModelManager, Worker):
             trainer_parallel_strategies=resharding_strategies,
             offload_frist_strategy=False,
             model_provider=self.model_provider_func,
-            _logger=self._logger
+            _logger=self._logger,
         )
 
         if first_world_size == -1:
@@ -988,13 +997,6 @@ class MegatronActor(MegatronModelManager, Worker):
 
     def apply_parallel_strategy(self, parallel_strategy):
         """Apply specified training parallel strategy"""
-
-        from megatron.core import __version__ as megatron_version
-        from packaging import version
-
-        assert version.parse(megatron_version).minor == 11, (
-            "only megatron 0.11 is supported for online-resharding now"
-        )
 
         args = get_args()
         args.load = None
@@ -1275,6 +1277,7 @@ class MegatronActor(MegatronModelManager, Worker):
     def del_reshard_state_dict(self):
         if hasattr(self, "reshard_state_dict"):
             del self.reshard_state_dict
+            clear_memory()
 
     def sync_model_to_rollout_transfer(self):
         if not self.is_running:
@@ -1289,11 +1292,9 @@ class MegatronActor(MegatronModelManager, Worker):
                     self.rollout_group_name,
                     weight_dst_rank,
                 )
-        torch.cuda.synchronize()
         self.del_reshard_state_dict()
-        torch.cuda.empty_cache()
 
-    def sync_model_to_rollout_offload(self):
+    def get_model_state_and_offload(self):
         """Send the model weights to the destination ranks in the rollout task."""
         if not self.is_running:
             return

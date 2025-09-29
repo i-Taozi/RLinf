@@ -183,13 +183,10 @@ class MathRunner:
                 )
 
         # Init workers
+        self.rollout.init_worker().wait()
         if self.use_pre_process_policy:
-            self.rollout.init_worker().wait()
             self.rollout.offload_engine().wait()
-            self.actor.init_worker().wait()
-        else:
-            self.actor.init_worker().wait()
-            self.rollout.init_worker().wait()
+        self.actor.init_worker().wait()
         if self.has_dedicated_inference:
             self.inference.init_worker().wait()
         if self.has_dedicated_reward:
@@ -307,10 +304,9 @@ class MathRunner:
             self.actor.sync_model_to_inference()
             self.inference.sync_model_from_actor().wait()
 
-        self.actor.sync_model_to_rollout_offload().wait()
+        self.actor.get_model_state_and_offload().wait()
         self.actor.sync_model_to_rollout_transfer()
         self.rollout.sync_model_from_actor().wait()
-        # self.actor.del_reshard_state_dict().wait()
 
     def run(self):
         epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)
