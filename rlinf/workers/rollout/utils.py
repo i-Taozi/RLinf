@@ -562,10 +562,11 @@ def get_rollout_backend_worker(
         from rlinf.workers.rollout.sglang.sglang_worker import (
             AsyncSGLangWorker,
             SGLangWorker,
+            UnifySGLangWorker,
         )
 
         if placement.placement_mode == PlacementMode.COLLOCATED:
-            return SGLangWorker
+            return UnifySGLangWorker
         elif placement.placement_mode in [
             PlacementMode.DISAGGREGATED,
             PlacementMode.AUTO,
