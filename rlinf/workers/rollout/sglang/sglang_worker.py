@@ -32,6 +32,7 @@ from rlinf.data.io_struct import (
     CompletionInfo,
     RolloutRequest,
     RolloutResult,
+    SeqGroupInfo,
 )
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.scheduler.dynamic_scheduler.utils import (
@@ -50,6 +51,7 @@ from rlinf.utils.placement import (
 )
 from rlinf.workers.rollout.sglang import Engine, io_struct
 from rlinf.workers.rollout.utils import (
+    RunningStatusManager,
     print_sglang_outputs,
 )
 from toolkits.math_verifier.verify import MathRewardModel, math_verify_call
@@ -820,6 +822,50 @@ class UnifySGLangWorker(Worker):
         ]
         self._reward_model = MathRewardModel(scale=self._cfg.reward.reward_scale)
 
+        self.status_manager = RunningStatusManager()
+
+        # Initialize meta_stats_collector for async operations
+        self._collect_meta_stats = getattr(
+            self._cfg.rollout, "collect_meta_stats", False
+        )
+        self._use_auto_scheduler = self._placement._placement_mode == PlacementMode.AUTO
+
+        if self._collect_meta_stats:
+            self._init_meta_stats_collector()
+        if self._use_auto_scheduler:
+            self._init_scheduler()
+
+    def _init_scheduler(self):
+        self.schedule_channel = self.connect_channel(get_scheduler_channel("rollout"))
+
+        self._scheduler = RolloutScalingScheduler(
+            self._rank, self.schedule_channel, self
+        )
+
+        if self._collect_meta_stats:
+            schedule_stats_file = getattr(
+                self._cfg.rollout,
+                "schedule_meta_stats_file",
+                f"sglang_meta_stats_rank_{self._rank}.jsonl",
+            )
+            self.schedule_meta_stats_collector = MetaInfoStatsCollector(
+                schedule_stats_file
+            )
+            self.schedule_batch_counter = 0
+
+        # Initialize report progress
+        self.progress_report_interval = 1.0  # seconds
+        self.last_progress_report = time.time()
+
+    def _init_meta_stats_collector(self):
+        async_stats_file = getattr(
+            self._cfg.rollout,
+            "async_meta_stats_file",
+            f"sglang_meta_stats_async_rank_{self._rank}.jsonl",
+        )
+        self.async_meta_stats_collector = MetaInfoStatsCollector(async_stats_file)
+        self.async_batch_counter = 0
+
     def _get_sampling_param_from_config(self) -> dict:
         """
         Get sampling parameters from the configuration.
@@ -987,8 +1033,10 @@ class UnifySGLangWorker(Worker):
         self.log_info(f"SGLang worker {self._rank} initialized.")
         if self._cfg.rollout.validate_weight:
             await self._validate_weight_at_first()
-        if not self._placement.is_disaggregated:
+        if self._placement._is_collocated():
             await self.offload_engine()
+        if self._use_auto_scheduler:
+            asyncio.create_task(self._scheduler.main_loop())
 
     async def offload_engine(self):
         """
@@ -996,6 +1044,12 @@ class UnifySGLangWorker(Worker):
         """
         await self._engine.tokenizer_manager.release_memory_occupation(
             obj=ReleaseMemoryOccupationReqInput()
+        )
+
+    async def abort_generation(self):
+        """Abort the generation."""
+        await self._engine.tokenizer_manager.abort_generation(
+            obj=io_struct.AbortGenerationInput()
         )
 
     async def sync_model_from_actor(self):
@@ -1012,7 +1066,7 @@ class UnifySGLangWorker(Worker):
 
         return state
 
-    async def rollout(self, input_channel: Channel, output_channel: Channel):
+    async def _rollout(self, input_channel: Channel, output_channel: Channel):
         request: RolloutRequest = input_channel.get()
         output_channel.device_lock.acquire()
         # Repeat prompts based on the group_size config
@@ -1079,3 +1133,230 @@ class UnifySGLangWorker(Worker):
 
         await self._stop()
         output_channel.device_lock.release()
+
+    async def _async_generate_single(
+        self,
+        idx: int,
+        input_ids: List[int],
+        sampling_params: dict,
+        return_logprob: bool,
+    ):
+        result = await self._engine.async_generate(
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_logprob=return_logprob,
+        )
+        return idx, result
+
+    async def _async_generate_group(self, seq_group_info: SeqGroupInfo):
+        if seq_group_info.num_aborted > 0:
+            # migrated sequences need to continue generation
+            seq_idx = seq_group_info.idx_aborted.copy()
+            seq_group_info.idx_aborted.clear()
+            input_batch: List[List[int]] = []
+            sampling_params: List[Dict] = []
+            for idx in seq_idx:
+                generated_ids: List[int] = seq_group_info.results[idx]["output_ids"]
+                input_batch.append(seq_group_info.input_ids + generated_ids)
+                params = self._sampling_params.copy()
+                params["max_new_tokens"] -= len(generated_ids)
+                sampling_params.append(params)
+        else:
+            # new sequence group
+            assert seq_group_info.num_returned == 0
+            seq_idx = list(range(seq_group_info.group_size))
+            input_batch = [seq_group_info.input_ids] * seq_group_info.group_size
+            sampling_params = [self._sampling_params] * seq_group_info.group_size
+
+        tasks = [
+            asyncio.create_task(
+                self._async_generate_single(
+                    idx, input_ids, params, self._return_logprobs
+                )
+            )
+            for idx, input_ids, params in zip(seq_idx, input_batch, sampling_params)
+        ]
+        for idx, result in await asyncio.gather(*tasks):
+            seq_group_info.record_sglang_result(idx, result)
+
+        return seq_group_info
+
+    async def rollout(self, input_channel: Channel, output_channel: Channel):
+        request: RolloutRequest = input_channel.get()
+        groups = request.to_seq_group_infos()
+        async_wait_type = (
+            asyncio.FIRST_COMPLETED
+            if self._placement.is_pipeline
+            else asyncio.ALL_COMPLETED
+        )
+        with output_channel.device_lock, self.worker_timer():
+            num_residual = self.status_manager.num_seq_group
+            assert num_residual == 0, (
+                f"There are {num_residual} "
+                f"sequence group{'' if num_residual == 1 else 's'} before rollout."
+            )
+
+            for group in groups:
+                task = asyncio.create_task(self._async_generate_group(group))
+                self.status_manager.add_task(group, task)
+
+            all_rollout_results = []
+            while pending := self.status_manager.get_running_tasks():
+                done, pending = await asyncio.wait(pending, return_when=async_wait_type)
+                returned_seq_groups: List[SeqGroupInfo] = [
+                    task.result() for task in done
+                ]
+                for group in returned_seq_groups:
+                    if group.all_completed:
+                        rollout_result = RolloutResult.from_sglang_results(
+                            group.results,
+                            group.group_size,
+                            [group.input_ids] * group.group_size,
+                            [group.answer] * group.group_size,
+                            self._return_logprobs,
+                        )
+                        if self._placement.is_pipeline:
+                            (
+                                rewards,
+                                advantages,
+                            ) = await asyncio.to_thread(
+                                self._compute_reward_and_advantage,
+                                group.results,
+                                [group.answer] * group.group_size,
+                            )
+
+                            rollout_result.rewards = torch.tensor(
+                                rewards, dtype=torch.float32
+                            ).reshape(-1, 1)
+                            rollout_result.advantages = advantages
+
+                            await output_channel.put(
+                                item=rollout_result, async_op=True
+                            ).async_wait()
+                        else:
+                            # collocated mode, collect all results and send at once at the end
+                            all_rollout_results.append(rollout_result)
+                        self.status_manager.mark_done(group)
+                    else:
+                        self.status_manager.mark_aborted(group)
+
+                self.log_info(
+                    f"{self.status_manager.num_seq_group_done} groups returned, "
+                    f"{self.status_manager.num_seq_group_running} groups are still running."
+                )
+
+                if (
+                    self._use_auto_scheduler
+                    and self.status_manager.num_seq_group_running == 0
+                ):
+                    # rollout should not exit immediately when using auto scheduler
+                    # because there might be migrations
+                    # if so, `pending` will not be empty in while loop condition
+                    await self.status_manager.exit_rollout_iter.wait()
+                    self.status_manager.exit_rollout_iter.clear()
+
+            self.status_manager.clear()
+
+            if not self._placement.is_pipeline:
+                rollout_result = RolloutResult.merge_result_list(all_rollout_results)
+                await output_channel.put(
+                    item=rollout_result, async_op=True
+                ).async_wait()
+
+            if self._placement._is_collocated() or self._placement._is_auto():
+                await self.offload_engine()
+                if self._use_auto_scheduler:
+                    await self._scheduler.report_offloaded()
+
+
+class RolloutScalingScheduler:
+    def __init__(
+        self,
+        rank: int,
+        scheduler_channel: Channel,
+        worker: UnifySGLangWorker,
+    ):
+        self._rank = rank
+        self.scheduler_channel = scheduler_channel
+        self.scheduler_request_queue = get_scheduler_request_queue(self._rank)
+        self.scheduler_response_queue = get_scheduler_response_queue(self._rank)
+        self.worker = worker
+        self.status_manager = self.worker.status_manager
+
+    async def report(self):
+        report = RolloutReport(
+            total_requests=self.status_manager.num_seq_group,
+            completed_requests=self.status_manager.num_seq_group_done,
+            total_tasks=self.status_manager.num_seq,
+            completed_tasks=self.status_manager.num_seq_returned,
+            running_tasks=self.status_manager.num_seq_running,
+            timestamp=time.time(),
+        )
+        scheduler_response = RolloutScheduleInfo(instance_id=self._rank, report=report)
+        await self.scheduler_channel.put(
+            scheduler_response,
+            queue_name=self.scheduler_response_queue,
+            async_op=True,
+        ).async_wait()
+
+    async def migrate_out(self):
+        await self.worker.abort_generation()
+        await self.wait_until_no_running_task()
+
+        assert self.status_manager.num_seq_group_running == 0
+        assert self.status_manager.num_seq_running == 0
+        scheduler_response = RolloutScheduleInfo(
+            instance_id=self._rank, data=self.status_manager.get_aborted_seq_groups()
+        )
+        await self.scheduler_channel.put(
+            scheduler_response,
+            queue_name=self.scheduler_response_queue,
+            async_op=True,
+        ).async_wait()
+
+        # Notify rollout() to exit when there are no running tasks
+        self.status_manager.exit_rollout_iter.set()
+
+    async def migrate_in(self, scheduler_request: RolloutScheduleInfo):
+        seq_groups: List[SeqGroupInfo] = scheduler_request.data
+        for group in seq_groups:
+            task = asyncio.create_task(self.worker._async_generate_group(group))
+            self.status_manager.add_task(group, task)
+
+    async def wait_for_finish(self):
+        await self.wait_until_no_running_task()
+        self.status_manager.exit_rollout_iter.set()
+
+    async def wait_until_no_running_task(self):
+        # After rollout() launches tasks initially, only migrate_in can increase num_seq_group_running.
+        # migrate_in will not be called concurrently with other RolloutScalingScheduler methods,
+        # so num_seq_group_running will not increase between the return of this coroutine and when the caller regains control.
+        while self.status_manager.num_seq_group_running > 0:
+            await asyncio.sleep(0.1)
+
+    async def report_offloaded(self):
+        scheduler_response = RolloutScheduleInfo(
+            instance_id=self._rank, action=RolloutAction.Offloaded
+        )
+        await self.scheduler_channel.put(
+            scheduler_response,
+            queue_name=self.scheduler_response_queue,
+            async_op=True,
+        ).async_wait()
+
+    async def main_loop(self):
+        while True:
+            request: RolloutScheduleInfo = await self.scheduler_channel.get(
+                queue_name=self.scheduler_request_queue, async_op=True
+            ).async_wait()
+            self.worker.log_info(f"Received scheduler request action: {request.action}")
+            if request.action == RolloutAction.Report:
+                await self.report()
+            elif request.action == RolloutAction.Migrate_In:
+                await self.migrate_in(request)
+            elif request.action == RolloutAction.Migrate_Out:
+                await self.migrate_out()
+            elif request.action == RolloutAction.Wait_For_Finish:
+                await self.wait_for_finish()
+            elif request.action == RolloutAction.Finish:
+                await self.wait_for_finish()

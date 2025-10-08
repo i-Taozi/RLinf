@@ -85,7 +85,7 @@ conflicts = [
 [tool.ruff]
 line-length = 88
 indent-width = 4
-target-version = "py38"
+target-version = "py311"
 
 [tool.ruff.lint]
 isort = {known-first-party = ["rlinf"]}
@@ -98,6 +98,7 @@ ignore = [
     "D104", # "Missing docstring in public package"
     "D203", # "incorrect-blank-line-before-class", conflict with D211,
     "D213", # "multi-line-summary-second-line", conflict with D212
+    "UP006",
 ]
 fixable = ["ALL"]
 unfixable = []

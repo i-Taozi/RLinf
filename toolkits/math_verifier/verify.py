@@ -386,7 +386,7 @@ def verify_math_solution(answer: str, solution: str):
 
 def math_verify_call(
     responses: List[str],
-    references: List[str],
+    references: List[List[str]],
     timeout: int = 10,
     check_xml_format=False,
 ) -> List:

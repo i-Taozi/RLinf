@@ -362,7 +362,7 @@ class RolloutManager(ComponentManager):
                 migrate_batch = migrate_out_batches[migrate_out_batches_index]
                 migrate_in_batches.append(migrate_batch)
                 migrate_out_batches_index += 1
-                running_tasks += migrate_batch.get_running_tasks()
+                running_tasks += migrate_batch.num_aborted
 
             self._logger.info(
                 f"[Migrate-Info] rollout-{rollout_instance_id} migrate_in_batches: {len(migrate_in_batches)}, running_tasks={report.running_tasks} -> {running_tasks} ~= {instance_running_tasks_expected}"
@@ -373,7 +373,7 @@ class RolloutManager(ComponentManager):
             ):
                 migrate_in_batches += migrate_out_batches[migrate_out_batches_index:]
                 running_tasks += sum(
-                    migrate_batch.get_running_tasks()
+                    migrate_batch.num_aborted
                     for migrate_batch in migrate_out_batches[migrate_out_batches_index:]
                 )
                 migrate_out_batches_index = migrate_out_batches_len
