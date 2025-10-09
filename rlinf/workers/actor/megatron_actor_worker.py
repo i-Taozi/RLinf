@@ -88,6 +88,13 @@ from rlinf.utils.utils import (
 from rlinf.workers.rollout.utils import RankMapper
 from toolkits.math_verifier.verify import math_verify_call
 
+try:
+    from params_resharding import resharding_init
+
+    HAVE_RESHARDING = True
+except ImportError:
+    HAVE_RESHARDING = False
+
 
 class MegatronActor(MegatronModelManager, Worker):
     """The class for running the actor training using Megatron."""
@@ -916,14 +923,9 @@ class MegatronActor(MegatronModelManager, Worker):
 
     def init_trainer_resharding(self, first_world_size: int = -1):
         """Init resharding func."""
-        try:
-            from params_resharding import resharding_init
-        except ImportError as e:
-            self._logger.error(
-                "params_resharding is not installed, resharding is not supported"
-            )
-            raise e
-
+        assert HAVE_RESHARDING, (
+            "params_resharding is not installed, resharding is not supported"
+        )
         from megatron.core import __version__ as megatron_version
         from packaging import version
 

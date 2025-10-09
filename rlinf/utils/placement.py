@@ -348,6 +348,9 @@ class ModelParallelComponentPlacement(ComponentPlacement):
                 self._config.cluster, "use_pre_process_policy", False
             )
             if use_pre_process_policy:
+                assert (
+                    self._actor_gpus[-1] - self._actor_gpus[0] + 1
+                ) % self.rollout_tp_size == 0
                 self._rollout_gpus = (
                     list(range(1 + self._actor_gpus[-1])) + self._rollout_gpus
                 )

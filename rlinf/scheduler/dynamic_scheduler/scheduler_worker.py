@@ -22,7 +22,6 @@ from rlinf.scheduler.dynamic_scheduler.manager import (
     RolloutManager,
 )
 from rlinf.scheduler.dynamic_scheduler.utils import (
-    get_scheduler_channel,
     get_valid_dp_sizes,
 )
 from rlinf.utils.placement import ComponentPlacement
@@ -57,118 +56,53 @@ class SchedulerWorker(Worker):
         assert "rollout" in self.components, "rollout component is required"
         assert "actor" in self.components, "actor component is required"
 
-        self.component_channels = {}
-        for component in self.components:
-            self.component_channels[component] = self.create_channel(
-                get_scheduler_channel(component)
+        component_manager_kwargs = {
+            "config": config,
+            "component_placement": component_placement,
+            "use_pre_process_policy": self.use_pre_process_policy,
+            "use_wait_before_last_iter_policy": self.use_wait_before_last_iter_policy,
+            "_logger": self._logger,
+            "channel_factory": self.create_channel,
+        }
+
+        self.rollout_manager = RolloutManager(
+            **component_manager_kwargs,
+        )
+        self.actor_manager = ActorManager(
+            **component_manager_kwargs,
+        )
+
+        if "inference" in self.components:
+            self.inference_manager = InferenceManager(
+                **component_manager_kwargs,
+            )
+        else:
+            self.inference_manager = ComponentManager(
+                "dummy", None, None, None, None, None, None
             )
 
-        # Note. mode_parallel_size here represents the number of GPUs, the quantity required for a single instance
-        self.init_rollout_instance_num = component_placement.rollout_dp_size
-        self.init_rollout_gpu_num = component_placement.rollout_world_size
-        self.rollout_model_parallel_size = (
-            self.init_rollout_gpu_num // self.init_rollout_instance_num
-        )
-
-        self.init_actor_instance_num = component_placement.actor_dp_size
-        self.init_actor_gpu_num = component_placement.actor_world_size
-        self.actor_model_parallel_size = (
-            self.init_actor_gpu_num // self.init_actor_instance_num
-        )
-
-        self.init_inference_instance_num = component_placement.inference_world_size
-        self.init_inference_gpu_num = component_placement.inference_world_size
-        self.inference_model_parallel_size = (
-            0
-            if self.init_inference_gpu_num == 0
-            else (self.init_inference_gpu_num // self.init_inference_instance_num)
-        )
-
-        # Get valid dp size list for actor
-        self.actor_valid_dp_sizes = get_valid_dp_sizes(
+        actor_valid_dp_sizes = get_valid_dp_sizes(
             self.cfg,
             self.component_placement._cluster_num_gpus,
-            self.actor_model_parallel_size,
+            self.actor_manager.model_parallel_size,
         )
 
-        # Create ComponentManager for each component
-        self.rollout_manager = RolloutManager(
-            config=config,
-            channel=self.component_channels["rollout"],
-            model_parallel_size=self.rollout_model_parallel_size,
-            instance_num=self.init_rollout_instance_num,
-            communication_instance_num=(
-                self.total_gpus // self.rollout_model_parallel_size
-            ),
-            _logger=self._logger,
-            use_pre_process_policy=self.use_pre_process_policy,
-            use_wait_before_last_iter_policy=self.use_wait_before_last_iter_policy,
-        )
-
-        self.actor_manager = ActorManager(
-            config=config,
-            channel=self.component_channels["actor"],
-            model_parallel_size=self.actor_model_parallel_size,
-            instance_num=self.init_actor_instance_num,
-            communication_instance_num=1,
-            _logger=self._logger,
-            valid_dp_sizes=self.actor_valid_dp_sizes,
-            use_pre_process_policy=self.use_pre_process_policy,
-            use_wait_before_last_iter_policy=self.use_wait_before_last_iter_policy,
-        )
-
-        self.inference_manager = ComponentManager(
-            "dummy", None, None, None, None, None, None
-        )
-        if self.inference_model_parallel_size > 0:
-            self.inference_manager = InferenceManager(
-                config=config,
-                channel=self.component_channels["inference"],
-                model_parallel_size=self.inference_model_parallel_size,
-                instance_num=self.init_inference_instance_num,
-                communication_instance_num=1,
-                _logger=self._logger,
-                use_pre_process_policy=self.use_pre_process_policy,
-                use_wait_before_last_iter_policy=self.use_wait_before_last_iter_policy,
-            )
+        self.actor_manager.actor_valid_dp_sizes = actor_valid_dp_sizes
+        self.rollout_manager.actor_valid_dp_sizes = actor_valid_dp_sizes
 
     async def run(self):
         """Run the scheduler."""
         await self.pre_process()
         await self.main_loop()
-        await self.post_process()
 
     async def pre_process(self):
         """Pre process.
 
-        Policy : Allocate resource to rollout first, then allocate resource to actor.
+        Reset component manager states and execute use_pre_process_policy.
         """
-        self.rollout_manager.reset(self.init_rollout_instance_num)
-        self.actor_manager.reset(self.init_actor_instance_num)
-        self.inference_manager.reset(self.init_inference_instance_num)
-
-        if not self.use_pre_process_policy:
-            return
-
-        assert self.init_actor_gpu_num % self.rollout_model_parallel_size == 0
-        migrate_out_instance_num = (
-            self.init_actor_gpu_num // self.rollout_model_parallel_size
-        )
-        await self.rollout_manager.pre_process(migrate_out_instance_num)
-
+        await self.rollout_manager.pre_process()
         await self.actor_manager.pre_process()
         await self.inference_manager.pre_process()
-
-        # Offset may changed by pre_process()
-        assert (
-            self.rollout_manager.current_instance_num
-            == self.init_rollout_instance_num - migrate_out_instance_num
-        )
-        assert self.rollout_manager.current_instance_offset == migrate_out_instance_num
-
-    async def post_process(self):
-        """Post Process."""
-        pass
 
     async def main_loop(self):
         """Main loop.
@@ -176,26 +110,30 @@ class SchedulerWorker(Worker):
         The signal synchronization granularity is consistent with the actor training granularity.
         Resource allocation is performed after the actor has completed one execution of optimizer.step().
         """
+        available_gpu_num = 0
         for train_iter in range(self.cfg.algorithm.n_minibatches):
             # Wait for actor ready to update
-
             await self.actor_manager.wait_for_actor_update()
 
             # Trying to release the resource of rollout and inference
             rollout_released_gpu_num = await self.rollout_manager.release_resource(
                 train_iter,
-                self.actor_valid_dp_sizes,
-                self.actor_model_parallel_size,
                 self.actor_manager.current_instance_num,
             )
             inference_released_gpu_num = await self.inference_manager.release_resource(
                 train_iter, self.rollout_manager.current_instance_num == 0
             )
             self.log_info(
-                f"[Release-Info] train_iter={train_iter}, rollout_released_gpu_num={rollout_released_gpu_num}, inference_released_gpu_num={inference_released_gpu_num}"
+                f"[Release-Info] train_iter={train_iter}, rollout_released_gpu_num={rollout_released_gpu_num}, inference_released_gpu_num={inference_released_gpu_num}, available_gpu_num={available_gpu_num}"
+            )
+            total_available_gpu_num = (
+                rollout_released_gpu_num
+                + inference_released_gpu_num
+                + available_gpu_num
             )
 
             # Trying to allocate the resource to actor
-            await self.actor_manager.allocate_resource(
-                rollout_released_gpu_num + inference_released_gpu_num, train_iter
+            increment_gpu_num = await self.actor_manager.allocate_resource(
+                total_available_gpu_num, train_iter
             )
+            available_gpu_num = total_available_gpu_num - increment_gpu_num
