@@ -13,9 +13,10 @@
 # limitations under the License.
 
 import asyncio
+import inspect
 import math
 from logging import Logger
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from omegaconf import DictConfig
 
@@ -33,10 +34,13 @@ from rlinf.utils.placement import ComponentPlacement
 class ComponentManager:
     """ComponentManager is a base class for all component managers.
 
-    Specific component managers should inherit this class and implement the following methods:
-    - pre_process : call super().pre_process() to reset the state of the component and implement the pre-process logic
-    - release_resource(Optional) : release the resource of the component
-    - allocate_resource(Optional) : allocate the resource of the component
+    Specific component managers should inherit this class and override the following methods:
+    - pre_process_impl : Pre-process implementation
+    - main_loop_finalize : Process after the last training iteration in main_loop
+    - release_resource (Optional) : Release the resource of the component
+    - allocate_resource (Optional) : Allocate the resource of the component
+
+    NOTE. Subclasses must override exactly one of the release_resource and allocate_resource methods. They cannot override both or neither.
     """
 
     def __init__(
@@ -60,6 +64,7 @@ class ComponentManager:
             channel_factory (Callable[[str], Channel]): The factory for creating channels.
             _logger (Logger): The logger for this training task.
         """
+        self._check_method_overrides()
         self.component_role = component_role
         self.cfg = config
         self.component_placement = component_placement
@@ -85,6 +90,51 @@ class ComponentManager:
         # Note. mode_parallel_size here represents the number of GPUs, the quantity required for a single instance
         self.model_parallel_size = self.init_gpu_num // self.init_instance_num
 
+    def _check_method_overrides(self):
+        """Check that the subclass overrides exactly one of the required methods.
+
+        subclass should override pre_process_impl() and one of [release_resource(), allocate_resource()]
+        """
+        pre_process_impl_overridden = (
+            type(self).pre_process_impl != ComponentManager.pre_process_impl
+        )
+        main_loop_finalize_overridden = (
+            type(self).main_loop_finalize != ComponentManager.main_loop_finalize
+        )
+        if not pre_process_impl_overridden:
+            raise TypeError(
+                f"{self.__class__.__name__} must override pre_process_impl()"
+            )
+        if not main_loop_finalize_overridden:
+            raise TypeError(
+                f"{self.__class__.__name__} must override main_loop_finalize()"
+            )
+
+        self.release_overridden = (
+            type(self).release_resource != ComponentManager.release_resource
+        )
+        self.allocate_overridden = (
+            type(self).allocate_resource != ComponentManager.allocate_resource
+        )
+
+        if self.release_overridden and self.allocate_overridden:
+            raise TypeError(
+                f"{self.__class__.__name__} must override only one of "
+                "release_resource() or allocate_resource(), not both."
+            )
+        elif not self.release_overridden and not self.allocate_overridden:
+            raise TypeError(
+                f"{self.__class__.__name__} must override either "
+                "release_resource() or allocate_resource()."
+            )
+
+        self.release_fn_parameters = inspect.signature(
+            self.release_resource
+        ).parameters.keys()
+        self.allocate_fn_parameters = inspect.signature(
+            self.allocate_resource
+        ).parameters.keys()
+
     def create_channel(self, communication_instance_num: int):
         """Create channel queues for communication.
 
@@ -102,32 +152,69 @@ class ComponentManager:
         self.current_gpu_num = self.init_gpu_num
         self.current_instance_offset = 0
 
-    def update(self, release_instance_num: int = 0, increment_instance_num: int = 0):
+    def update(self, released_instance_num: int = 0, incremental_instance_num: int = 0):
         """Update state of ComponentManager.
 
         Args:
-            release_instance_num (int): The number of instances to release.
-            increment_instance_num (int): The number of instances to increment.
+            released_instance_num (int): The number of instances to release.
+            incremental_instance_num (int): The number of instances to increment.
         """
-        assert release_instance_num == 0 or increment_instance_num == 0
-        if release_instance_num == 0 and increment_instance_num == 0:
+        assert released_instance_num == 0 or incremental_instance_num == 0
+        if released_instance_num == 0 and incremental_instance_num == 0:
             return
 
-        if release_instance_num != 0:
-            assert self.current_instance_num >= release_instance_num
-            self.current_gpu_num -= release_instance_num * self.model_parallel_size
-            self.current_instance_num -= release_instance_num
-            self.current_instance_offset += release_instance_num
+        if released_instance_num != 0:
+            assert self.current_instance_num >= released_instance_num
+            self.current_gpu_num -= released_instance_num * self.model_parallel_size
+            self.current_instance_num -= released_instance_num
+            self.current_instance_offset += released_instance_num
         else:
-            assert increment_instance_num > 0
-            self.current_instance_num += increment_instance_num
+            assert incremental_instance_num > 0
+            self.current_instance_num += incremental_instance_num
             self.current_gpu_num = self.current_instance_num * self.model_parallel_size
             assert self.current_gpu_num <= self.component_placement._cluster_num_gpus
-            self.current_instance_offset -= increment_instance_num
+            self.current_instance_offset -= incremental_instance_num
 
-    async def pre_process(self):
-        """Pre-process the component."""
+    async def pre_process(self, *args, **kwargs):
+        """Pre-process. Reset state of ComponentManager and call pre_process_impl."""
         self.reset()
+        await self.pre_process_impl(*args, **kwargs)
+
+    async def release_or_allocate(self, *args, **kwargs) -> Tuple[int, int]:
+        """Execute release_resource or allocate_resource for this component.
+
+        Returns:
+            released_gpu_num (int): The number of released GPU resources.
+            incremental_gpu_num (int): The number of incremental GPU resources.
+        """
+        train_iter = kwargs["train_iter"]
+        if train_iter == self.n_minibatches - 1:
+            await self.main_loop_finalize()
+            return 0, 0
+
+        release_fn_kwargs = {}
+        allocate_fn_kwargs = {}
+        if self.release_overridden:
+            for key in self.release_fn_parameters:
+                release_fn_kwargs[key] = kwargs[key]
+            allocate_fn_kwargs = kwargs
+        else:
+            for key in self.allocate_fn_parameters:
+                allocate_fn_kwargs[key] = kwargs[key]
+            release_fn_kwargs = kwargs
+
+        released_gpu_num = await self.release_resource(**release_fn_kwargs)
+        incremental_gpu_num = await self.allocate_resource(**allocate_fn_kwargs)
+        return (released_gpu_num, incremental_gpu_num)
+
+    # ------------------------------------------------- Need to be overridden by subclass -------------------------------------------------
+    async def pre_process_impl(self, *args, **kwargs):
+        """Implement of pre_process."""
+        pass
+
+    async def main_loop_finalize(self):
+        """Processing after the last training iteration in main_loop."""
+        pass
 
     async def release_resource(self, *args, **kwargs) -> int:
         """Release the GPU resources.
@@ -141,7 +228,7 @@ class ComponentManager:
         """Allocate the GPU resources.
 
         Returns:
-            int: The number of allocated GPU resources.
+            int: The number of incremental GPU resources.
         """
         return 0
 
@@ -153,10 +240,10 @@ class RolloutManager(ComponentManager):
 
     - report  : collect the report from all alive rollout instances
     - finish  : send Finish or Wait_For_Finish signal to all alive rollout instances
-        - check_finished : check if the rollout instances with id in in finished_instance_ids have been finished
+        - check_offloaded : check if the rollout instances with id in in finished_instance_ids have been finished
     - migrate : migrate the rollout instances
         - migrate_policy : return the max number of rollout instances could migrate out
-        - find_release_instance_num_needed : find the number of rollout instances needed to release
+        - find_released_instance_num_needed : find the number of rollout instances needed to release
         - TODO(balance_batches) : balance the batches between the rollout instances
     """
 
@@ -185,55 +272,17 @@ class RolloutManager(ComponentManager):
             self.cfg.algorithm.group_size * self.cfg.data.rollout_batch_size
         )
 
-    async def send_request(
-        self,
-        request: RolloutScheduleInfo,
-        rollout_instance_id: int,
-        need_feedback: bool = True,
-    ) -> Optional[RolloutScheduleInfo]:
-        """Send the request to the rollout instance.
+    # ------------------------------------------------- override start -------------------------------------------------
 
-        Args:
-            request (RolloutScheduleInfo): The request to send.
-            rollout_instance_id (int): The id of the rollout instance.
-            need_feedback (bool): Whether to wait for the response.
-
-        Returns:
-            RolloutScheduleInfo: The response from the rollout instance.
-        """
-        assert (
-            rollout_instance_id >= self.current_instance_offset
-            and rollout_instance_id < self.init_instance_num
-        )
-
-        await self.channel.put(
-            request,
-            queue_name=get_scheduler_request_queue(rollout_instance_id),
-            async_op=True,
-        ).async_wait()
-
-        if not need_feedback:
-            return None
-
-        response = await self.channel.get(
-            queue_name=get_scheduler_response_queue(rollout_instance_id),
-            async_op=True,
-        ).async_wait()
-        assert response.instance_id == rollout_instance_id, (
-            f"rollout_instance_id={rollout_instance_id}, response={response}"
-        )
-        return response
-
-    async def pre_process(self, running_tasks_threshold: int = -1):
-        """Pre-process the rollout instances.
+    async def pre_process_impl(self, running_tasks_threshold: int = -1):
+        """Pre-process implementation of rollout.
 
         Args:
             running_tasks_threshold (int): The threshold of running tasks. If -1, use half of rollout_total_tasks.
 
-        At the beginning of each Step, rollout occupies the resources of the actor until running_tasks is less than running_tasks_threshold.
+        At the beginning of each global step, rollout occupies the resources of the actor until running_tasks is less than running_tasks_threshold.
         Then, rollout releases the actor's resources.
         """
-        await super().pre_process()
         self.running_tasks = self.rollout_total_tasks
         if not self.use_pre_process_policy:
             return
@@ -258,6 +307,95 @@ class RolloutManager(ComponentManager):
                 await self.migrate(migrate_out_instance_num)
                 break
 
+    async def main_loop_finalize(self):
+        """Processing after the last training iteration in main_loop. Perform RolloutAction.Finish on all surviving instances."""
+        if self.current_instance_num == 0:
+            return
+
+        await self.finish(action=RolloutAction.Finish)
+
+    async def release_resource(
+        self,
+        train_iter: int,
+        actor_current_instance_num: int,
+    ) -> int:
+        """Release the GPU resources.
+
+        Args:
+            train_iter (int): The current train iter.
+            actor_current_instance_num (int): The current number of instances of the actor.
+
+        Returns:
+            int: The number of released GPU resources.
+        """
+        if self.current_instance_num == 0:
+            return 0
+
+        # Report Action
+        report_str = await self.report()
+        self._logger.info(report_str)
+
+        # Finish Action
+        if self.running_tasks == 0:
+            return await self.finish(action=RolloutAction.Finish)
+
+        # Wait_For_Finish Action
+        if (
+            self.use_wait_before_last_iter_policy
+            and train_iter == self.n_minibatches - 2
+        ):
+            return await self.finish(action=RolloutAction.Wait_For_Finish)
+
+        # Migrate Action
+        released_instance_num = self.migrate_policy(
+            train_iter, actor_current_instance_num
+        )
+        released_gpu_num = await self.migrate(released_instance_num)
+        return released_gpu_num
+
+    # ------------------------------------------------- override end -------------------------------------------------
+
+    async def send_request(
+        self,
+        request: RolloutScheduleInfo,
+        rollout_instance_id: int,
+        need_feedback: bool = True,
+    ) -> Optional[RolloutScheduleInfo]:
+        """Send the request to the rollout instance.
+
+        Args:
+            request (RolloutScheduleInfo): The request to send.
+            rollout_instance_id (int): The id of the rollout instance.
+            need_feedback (bool): Whether to wait for the response.
+
+        Returns:
+            RolloutScheduleInfo: The response from the rollout instance.
+        """
+        assert (
+            rollout_instance_id >= self.current_instance_offset
+            and rollout_instance_id < self.init_instance_num
+        ), (
+            f"rollout instance id={rollout_instance_id} is not in valid range=[{self.current_instance_offset}, {self.init_instance_num})"
+        )
+
+        await self.channel.put(
+            request,
+            queue_name=get_scheduler_request_queue(rollout_instance_id),
+            async_op=True,
+        ).async_wait()
+
+        if not need_feedback:
+            return None
+
+        response = await self.channel.get(
+            queue_name=get_scheduler_response_queue(rollout_instance_id),
+            async_op=True,
+        ).async_wait()
+        assert response.instance_id == rollout_instance_id, (
+            f"rollout_instance_id={rollout_instance_id}, response={response}"
+        )
+        return response
+
     async def report(self):
         """Check the report of rollout instances."""
         self.reports = [None for i in range(self.current_instance_num)]
@@ -279,13 +417,12 @@ class RolloutManager(ComponentManager):
             report_str += f"rollout{i + self.current_instance_offset} : total_tasks={report.total_tasks}, running_tasks={report.running_tasks}, completed_tasks={report.completed_tasks}\n"
         return report_str
 
-    async def check_finished(self, finished_instance_ids: List[int]):
+    async def check_offloaded(self, finished_instance_ids: List[int]):
         """Check if the rollout instances with id in in finished_instance_ids have been finished.
 
         Args:
             finished_instance_ids (List[int]): The list of finished instance ids.
         """
-        # Wait for all rollout instances to finish
         for rollout_instance_id in finished_instance_ids:
             response = await self.channel.get(
                 queue_name=get_scheduler_response_queue(rollout_instance_id),
@@ -318,11 +455,11 @@ class RolloutManager(ComponentManager):
             )
             finished_instance_ids.append(rollout_instance_id)
 
-        # Wait for all rollout instances to finish
-        await self.check_finished(finished_instance_ids)
+        # Wait for all rollout instances to offload
+        await self.check_offloaded(finished_instance_ids)
 
         released_instance_num = self.current_instance_num
-        self.update(release_instance_num=released_instance_num)
+        self.update(released_instance_num=released_instance_num)
         return released_instance_num * self.model_parallel_size
 
     async def migrate(self, migrate_instance_num: int) -> int:
@@ -341,7 +478,7 @@ class RolloutManager(ComponentManager):
         5. Before return, check and wait for all migrate out instances to finish
         """
         if migrate_instance_num == 0:
-            return
+            return 0
         assert migrate_instance_num < self.current_instance_num
         assert len(self.reports) == self.current_instance_num
 
@@ -360,7 +497,7 @@ class RolloutManager(ComponentManager):
             finished_instance_ids.append(rollout_instance_id)
 
         # Update the state of the ComponentManager
-        self.update(release_instance_num=migrate_instance_num)
+        self.update(released_instance_num=migrate_instance_num)
 
         # Calculate the expected running tasks for each instance
         instance_running_tasks_expected = (
@@ -429,16 +566,17 @@ class RolloutManager(ComponentManager):
                 )
         assert migrate_out_batches_index == migrate_out_batches_len
 
-        # Wait for all migrate out instances to finish
-        await self.check_finished(finished_instance_ids)
+        # Wait for migrate out instances offloaded
+        await self.check_offloaded(finished_instance_ids)
 
         return migrate_instance_num * self.model_parallel_size
 
-    def migrate_policy(self, train_iter: int) -> int:
+    def migrate_policy(self, train_iter: int, actor_current_instance_num: int) -> int:
         """Return the max number of rollout instances could migrate out.
 
         Args:
-            train_iter (int): current train iter
+            train_iter (int): current train iter.
+            actor_current_instance_num (int): The current number of instances of the actor.
 
         Returns:
             int: the max number of rollout instances could migrate out
@@ -447,32 +585,40 @@ class RolloutManager(ComponentManager):
             return 0
 
         # expect main_loop_finish rollout before last train iter
-        remain_iter_before_last = (self.n_minibatches - 1) - (train_iter + 1)
+        remain_iter_before_last = (self.n_minibatches - 1) - train_iter
 
         # find minimum instance num to main_loop_finish rollout before last train iter
         min_instance_num_needed = math.ceil(
             self.running_tasks
             / (self.pre_iter_speed_per_instance * remain_iter_before_last)
         )
-        return max(0, self.current_instance_num - min_instance_num_needed)
 
-    def find_release_instance_num_needed(
+        released_instance_num_max = max(
+            0, self.current_instance_num - min_instance_num_needed
+        )
+        released_instance_num_needed = self.find_released_instance_num_needed(
+            released_instance_num_max, actor_current_instance_num
+        )
+        self._logger.info(
+            f"[Release-Info] rollout migrate info: released_instance_num_max={released_instance_num_max}, released_instance_num_needed={released_instance_num_needed}"
+        )
+        return released_instance_num_needed
+
+    def find_released_instance_num_needed(
         self,
-        release_instance_num_max: int,
+        released_instance_num_max: int,
         actor_current_instance_num: int,
     ) -> int:
         """Find the number of rollout instances needed to release.
 
         Args:
-            release_instance_num_max (int): The maximum number of rollout instances to release.
-            actor_valid_dp_sizes (List[int]): The valid DP sizes of the actor.
-            actor_model_parallel_size (int): The model parallel size of the actor.
+            released_instance_num_max (int): The maximum number of rollout instances to release.
             actor_current_instance_num (int): The current number of instances of the actor.
 
         Returns:
             int: The number of rollout instances needed to release.
         """
-        if release_instance_num_max == 0:
+        if released_instance_num_max == 0:
             return 0
 
         actor_model_parallel_size = (
@@ -484,7 +630,7 @@ class RolloutManager(ComponentManager):
         index = self.actor_valid_dp_sizes.index(actor_current_instance_num)
         assert index < len(self.actor_valid_dp_sizes)
 
-        released_gpu_num_max = release_instance_num_max * self.model_parallel_size
+        released_gpu_num_max = released_instance_num_max * self.model_parallel_size
 
         actor_increment_gpu_num = 0
         for actor_dp_size in self.actor_valid_dp_sizes[index + 1 :]:
@@ -496,62 +642,11 @@ class RolloutManager(ComponentManager):
             else:
                 break
 
-        release_instance_num_needed = math.ceil(
+        released_instance_num_needed = math.ceil(
             actor_increment_gpu_num / self.model_parallel_size
         )
-        assert release_instance_num_needed <= release_instance_num_max
-        return release_instance_num_needed
-
-    async def release_resource(
-        self,
-        train_iter: int,
-        actor_current_instance_num: int,
-    ) -> int:
-        """Release the GPU resources.
-
-        Args:
-            train_iter (int): The current train iter.
-            actor_valid_dp_sizes (List[int]): The valid DP sizes of the actor.
-            actor_current_instance_num (int): The current number of instances of the actor.
-
-        Returns:
-            int: The number of released GPU resources.
-        """
-        if self.current_instance_num == 0:
-            return 0
-
-        # Report
-        report_str = await self.report()
-        self._logger.info(report_str)
-
-        # Finish or Wait_For_Finish action
-        is_finish_action = (self.running_tasks == 0) or (
-            train_iter == self.n_minibatches - 1
-        )
-        is_wait_for_finish_action = (
-            train_iter == self.n_minibatches - 2
-            and self.use_wait_before_last_iter_policy
-        )
-        if is_finish_action:
-            assert self.running_tasks == 0
-            return await self.finish(action=RolloutAction.Finish)
-        elif is_wait_for_finish_action:
-            return await self.finish(action=RolloutAction.Wait_For_Finish)
-
-        # Migrate
-        # 1. Find the max number of rollout instances could migrate out according to the migrate policy
-        # 2. Find the number of rollout instances needed to release according to the actor's DP size
-        # 3. Execute the migration
-        release_instance_num_max = self.migrate_policy(train_iter)
-        release_instance_num_needed = self.find_release_instance_num_needed(
-            release_instance_num_max,
-            actor_current_instance_num,
-        )
-        released_gpu_num = await self.migrate(release_instance_num_needed)
-        self._logger.info(
-            f"[Release-Info] rollout migrate info: release_instance_num_max={release_instance_num_max}, release_instance_num_needed={release_instance_num_needed}"
-        )
-        return released_gpu_num
+        assert released_instance_num_needed <= released_instance_num_max
+        return released_instance_num_needed
 
 
 class InferenceManager(ComponentManager):
@@ -587,27 +682,32 @@ class InferenceManager(ComponentManager):
             await asyncio.sleep(0.1)
 
         released_instance_num = self.current_instance_num
-        self.update(release_instance_num=released_instance_num)
+        self.update(released_instance_num=released_instance_num)
         return released_instance_num * self.model_parallel_size
 
-    async def pre_process(self):
-        """Pre-process the inference instances.
+    async def pre_process_impl(self):
+        """Pre-process implementation of inference.
 
-        Get a handler for the main loop finished signal.
+        Initialize the main loop finished handler.
         """
-        await super().pre_process()
         self.main_loop_finished_handler = self.channel.get(
             queue_name=get_scheduler_response_queue(), async_op=True
         )
 
+    async def main_loop_finalize(self):
+        """Processing after the last training iteration in main_loop."""
+        assert self.main_loop_finished_handler.done()
+
     async def release_resource(
-        self, train_iter: int, all_rollout_finished: bool
+        self,
+        train_iter: int,
+        rollout_current_instance_num: int,
     ) -> int:
         """Release the GPU resources.
 
         Args:
             train_iter (int): The current train iter.
-            all_rollout_finished (bool): Whether all rollout instances are finished.
+            rollout_current_instance_num (int): rollout current_instance_num.
 
         Returns:
             int: The number of released GPU resources.
@@ -615,26 +715,22 @@ class InferenceManager(ComponentManager):
         if self.current_instance_num == 0:
             return 0
 
-        # Wait for finish
-        is_last_iter = train_iter == self.n_minibatches - 2
-        need_wait_for_finish = (
-            is_last_iter and self.use_wait_before_last_iter_policy
-        ) or all_rollout_finished
-        if need_wait_for_finish:
-            return await self.wait_for_finish()
-
-        # Check for finish
         if not self.use_wait_before_last_iter_policy:
-            release_instance_num = (
+            released_instance_num = (
                 self.current_instance_num
                 if self.main_loop_finished_handler.done()
                 else 0
             )
-            self.update(release_instance_num=release_instance_num)
-            return release_instance_num * self.model_parallel_size
+            self.update(released_instance_num=released_instance_num)
+            return released_instance_num * self.model_parallel_size
 
-        if train_iter == self.n_minibatches - 1:
-            assert self.main_loop_finished_handler.done()
+        # Wait for finish
+        need_wait_for_finish = (train_iter == self.n_minibatches - 2) or (
+            rollout_current_instance_num == 0
+        )
+        if need_wait_for_finish:
+            return await self.wait_for_finish()
+
         return 0
 
 
@@ -662,12 +758,11 @@ class ActorManager(ComponentManager):
         )
         self.create_channel(1)
 
-    async def pre_process(self):
-        """Pre-process the actor instances.
+    async def pre_process_impl(self):
+        """Pre-process implementation of actor.
 
-        After Rollout pre_process() is done, send a signal to actor to start training.
+        If use_pre_process_policy is True, send a signal to actor to start training.
         """
-        await super().pre_process()
         if not self.use_pre_process_policy:
             return
         await self.channel.put(
@@ -681,12 +776,12 @@ class ActorManager(ComponentManager):
             available_gpu_num (int): The number of available GPU resources.
 
         Returns:
-            int: The number of allocated GPU resources.
+            incremental_gpu_num (int): The number of incremental GPU resources of actor.
         """
         if available_gpu_num < self.model_parallel_size:
             return 0
 
-        increment_world_size = 0
+        incremental_gpu_num = 0
         assert (
             self.current_instance_num in self.actor_valid_dp_sizes
             and self.current_instance_num != self.actor_valid_dp_sizes[-1]
@@ -697,57 +792,79 @@ class ActorManager(ComponentManager):
                 next_dp_size - self.current_instance_num
             ) * self.model_parallel_size
             if needed_gpu_nums <= available_gpu_num:
-                increment_world_size = needed_gpu_nums
+                incremental_gpu_num = needed_gpu_nums
             else:
                 break
 
-        assert increment_world_size <= available_gpu_num
-        return increment_world_size
+        assert incremental_gpu_num <= available_gpu_num
+        return incremental_gpu_num
 
-    async def allocate_resource(self, available_gpu_num: int, train_iter: int) -> int:
-        """Allocate the GPU resources.
-
-        Args:
-            available_gpu_num (int): The number of available GPU resources.
-            train_iter (int): The current train iter.
-
-        Returns:
-            int: The number of allocated GPU resources.
-        """
-        new_gpu_num = self.current_gpu_num
-        if train_iter == self.n_minibatches - 1:
-            new_gpu_num = self.init_gpu_num
-        elif available_gpu_num != 0:
-            new_gpu_num += self.try_allocate(available_gpu_num)
-
+    async def scale(self, new_gpu_num: int):
+        """Send scale info to actor."""
+        scale_info = {"world_size": new_gpu_num}
         if new_gpu_num == self.current_gpu_num:
-            await self.channel.put(
-                None, queue_name=get_scheduler_request_queue(), async_op=True
-            ).async_wait()
-            return 0
-
-        increment_gpu_num = 0
-        if new_gpu_num > self.current_gpu_num:
-            increment_instance_num = (
-                new_gpu_num // self.model_parallel_size - self.current_instance_num
-            )
-            increment_gpu_num = new_gpu_num - self.current_gpu_num
-            self.update(increment_instance_num=increment_instance_num)
-        else:
-            release_instance_num = (
-                self.current_instance_num - new_gpu_num // self.model_parallel_size
-            )
-            self.update(release_instance_num=release_instance_num)
+            scale_info = None
 
         await self.channel.put(
-            {"world_size": new_gpu_num},
+            scale_info,
             queue_name=get_scheduler_request_queue(),
             async_op=True,
         ).async_wait()
-        return increment_gpu_num
+
+        if new_gpu_num > self.current_gpu_num:
+            incremental_instance_num = (
+                new_gpu_num // self.model_parallel_size - self.current_instance_num
+            )
+            self.update(incremental_instance_num=incremental_instance_num)
+        elif new_gpu_num < self.current_gpu_num:
+            released_instance_num = (
+                self.current_instance_num - new_gpu_num // self.model_parallel_size
+            )
+            self.update(released_instance_num=released_instance_num)
+
+    async def main_loop_finalize(self):
+        """Processing after the last training iteration in main_loop. GPU resources of actor should be scale-down to init_gpu_num."""
+        return await self.scale(self.init_gpu_num)
+
+    async def allocate_resource(
+        self,
+        train_iter: int,
+        available_gpu_num: int,
+    ) -> int:
+        """Allocate the GPU resources.
+
+        Based on the value of available_gpu_num, try to allocate resources.
+        If the allocation result shows that the new_gpu_num != self.current_gpu_num, then send {"world_size": new_gpu_num} to actor, else send None.
+
+        Args:
+            train_iter (int): The current train iter.
+            available_gpu_num (int): The number of available GPU resources.
+
+        Returns:
+            incremental_gpu_num (int): The number of incremental GPU resources of actor.
+        """
+        incremental_gpu_num = self.try_allocate(available_gpu_num)
+        assert incremental_gpu_num >= 0
+
+        await self.scale(incremental_gpu_num + self.current_gpu_num)
+
+        return incremental_gpu_num
 
     async def wait_for_actor_update(self):
         """Wait for the actor update."""
         await self.channel.get(
             queue_name=get_scheduler_response_queue(), async_op=True
         ).async_wait()
+
+
+def create_component_manager(
+    component_role: str, component_manager_kwargs
+) -> ComponentManager:
+    """Create component manager."""
+    if component_role == "rollout":
+        return RolloutManager(**component_manager_kwargs)
+    elif component_role == "actor":
+        return ActorManager(**component_manager_kwargs)
+    elif component_role == "inference":
+        return InferenceManager(**component_manager_kwargs)
+    raise ValueError(f"can't find ComponentManager subcalss for {component_role}")
