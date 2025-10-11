@@ -1297,7 +1297,11 @@ class MegatronActor(MegatronModelManager, Worker):
         self.del_reshard_state_dict()
 
     def get_model_state_and_offload(self):
-        """Send the model weights to the destination ranks in the rollout task."""
+        """Send the model weights to the destination ranks in the rollout task.
+
+        When in COLLOCATED mode or when `use_pre_process_policy` is True, first offload the optimizer and gradients.
+        Then call `_get_rollout_model_state_dict()`, and finally offload the model weights.
+        """
         if not self.is_running:
             return
         if (
@@ -1307,9 +1311,14 @@ class MegatronActor(MegatronModelManager, Worker):
             if self.offload_optimizer:
                 self.offload_megatron_optimizer()
                 self.is_optimizer_offloaded = True
+            self.offload_model_weights_and_grad(
+                offload_grad=self.offload_grad, offload_weight=False
+            )
             self.reshard_state_dict = self._get_rollout_model_state_dict()
             if self.offload_weight:
-                self.offload_model_weights_and_grad(offload_grad=self.offload_grad)
+                self.offload_model_weights_and_grad(
+                    offload_grad=False, offload_weight=True
+                )
                 self.is_weight_offloaded = True
         else:
             assert self.component_placement._placement_mode in [

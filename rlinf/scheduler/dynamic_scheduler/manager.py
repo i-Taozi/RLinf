@@ -867,4 +867,4 @@ def create_component_manager(
         return ActorManager(**component_manager_kwargs)
     elif component_role == "inference":
         return InferenceManager(**component_manager_kwargs)
-    raise ValueError(f"can't find ComponentManager subcalss for {component_role}")
+    raise ValueError(f"can't find ComponentManager subclass for {component_role}")

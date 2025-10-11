@@ -416,11 +416,14 @@ class MegatronModelManager:
             output = output[..., 0]
         return output
 
-    def offload_model_weights_and_grad(self, offload_grad=True):
+    def offload_model_weights_and_grad(self, offload_grad=True, offload_weight=True):
         for model_idx, model_chunk in enumerate(self.model):
             if isinstance(model_chunk, DDP):
                 for buffer_idx, buffer in enumerate(model_chunk.buffers):
-                    if buffer.param_data.untyped_storage().size() > 0:
+                    if (
+                        offload_weight
+                        and buffer.param_data.untyped_storage().size() > 0
+                    ):
                         param_size = buffer.param_data.untyped_storage().size()
 
                         buffer.param_data.cpu_data = (
@@ -442,10 +445,10 @@ class MegatronModelManager:
 
             else:
                 for param_name, param in model_chunk.named_parameters():
-                    if param.data is not None:
+                    if offload_weight and param.data is not None:
                         param.data = param.data.to("cpu", non_blocking=True)
 
-                    if param.grad is not None:
+                    if offload_grad and param.grad is not None:
                         param.grad = param.grad.to("cpu", non_blocking=True)
 
         # clear memory
@@ -476,7 +479,7 @@ class MegatronModelManager:
                 device_id = torch.cuda.current_device()
                 for _, param in model_chunk.named_parameters():
                     param.data = param.data.to(device_id, non_blocking=True)
-                    if param.grad is not None:
+                    if load_grad and param.grad is not None:
                         param.grad = param.grad.to(device_id, non_blocking=True)
         clear_memory()
 
