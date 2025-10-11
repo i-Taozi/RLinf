@@ -243,7 +243,7 @@ class RolloutManager(ComponentManager):
         - check_offloaded : check if the rollout instances with id in in finished_instance_ids have been finished
     - migrate : migrate the rollout instances
         - migrate_policy : return the max number of rollout instances could migrate out
-        - find_released_instance_num_needed : find the number of rollout instances needed to release
+        - find_release_instance_num_needed : find the number of rollout instances needed to release
         - TODO(balance_batches) : balance the batches between the rollout instances
     """
 
@@ -596,7 +596,7 @@ class RolloutManager(ComponentManager):
         released_instance_num_max = max(
             0, self.current_instance_num - min_instance_num_needed
         )
-        released_instance_num_needed = self.find_released_instance_num_needed(
+        released_instance_num_needed = self.find_release_instance_num_needed(
             released_instance_num_max, actor_current_instance_num
         )
         self._logger.info(
@@ -604,7 +604,7 @@ class RolloutManager(ComponentManager):
         )
         return released_instance_num_needed
 
-    def find_released_instance_num_needed(
+    def find_release_instance_num_needed(
         self,
         released_instance_num_max: int,
         actor_current_instance_num: int,

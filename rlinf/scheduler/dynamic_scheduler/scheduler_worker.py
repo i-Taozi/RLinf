@@ -141,7 +141,6 @@ class SchedulerWorker(Worker):
                 released_gpu_num, incremental_gpu_num = await self.component_managers[
                     component
                 ].release_or_allocate(**release_or_allocate_params)
-                # self.log_info(f"[debug-hjh]{component} : released_gpu_num = {released_gpu_num}, incremental_gpu_num={incremental_gpu_num} => available_gpu_num={available_gpu_num}\n")
                 assert released_gpu_num == 0 or incremental_gpu_num == 0
 
                 available_gpu_num += released_gpu_num - incremental_gpu_num
