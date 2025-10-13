@@ -809,7 +809,7 @@ class MegatronActor(MegatronModelManager, Worker):
                 training_metrics = self.training_step(train_batch_iterator)
                 train_batch_iterator.check_finished_global_batch()
                 training_metrics_list.append(training_metrics)
-            self.scheudler_main_loop()
+            self.scheduler_main_loop()
 
         # Gather weights if overlap_param_gather before the next weight sync
         self._gather_weights_among_dp()
@@ -842,7 +842,7 @@ class MegatronActor(MegatronModelManager, Worker):
             return
         self.sync_with_scheduler(False)
 
-    def scheudler_main_loop(self):
+    def scheduler_main_loop(self):
         if not self.use_auto_scheduler:
             return
         resharding_response = self.sync_with_scheduler(True)
@@ -899,7 +899,7 @@ class MegatronActor(MegatronModelManager, Worker):
         ]
 
         if trained_batch_size > 0:
-            return parallel_state.get_group_by_ranks(rollout_metrics_valid_dp_ranks)
+            return parallel_state.create_group(rollout_metrics_valid_dp_ranks)
         return None
 
     def calc_num_microbatches(self):
