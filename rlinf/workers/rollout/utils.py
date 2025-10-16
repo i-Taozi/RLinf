@@ -15,10 +15,13 @@
 import asyncio
 import copyreg
 import gc
+import json
+import os
 import time
 import typing
 import weakref
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -671,3 +674,122 @@ class RunningStatusManager:
         return sum(sg.group_size for sg in self.get_running_seq_groups()) + sum(
             sg.group_size for sg in self.get_done_seq_groups()
         )
+
+
+@dataclass
+class RolloutEngineStats:
+    num_running_reqs: int = 0
+    max_running_reqs: int = 0
+    num_used_tokens: int = 0
+    max_total_num_tokens: int = 0
+    token_usage: float = 0.0
+    gen_throughput: float = 0.0
+    num_queue_reqs: int = 0
+
+
+class MetaInfoStatsCollector:
+    """Collector for SGLang meta_info statistics
+
+    This collector is only initialized when enabled via configuration.
+    Add the following parameters to your generation config section:
+
+    generation:
+      collect_meta_stats: true  # Enable meta_info statistics collection
+      meta_stats_file: "custom_meta_stats.jsonl"  # Optional: custom output file
+      async_meta_stats_file: "custom_async_meta_stats.jsonl"  # Optional: custom async output file
+      schedule_meta_stats_file: "custom_schedule_meta_stats.jsonl"  # Optional: custom schedule output file
+    """
+
+    def __init__(self, output_file: str = "sglang_meta_stats.jsonl"):
+        self.output_file = output_file
+        self.stats_buffer = []
+        self.buffer_size = 100  # Write to file every 100 records
+
+        # Ensure output directory exists
+        os.makedirs(
+            os.path.dirname(self.output_file)
+            if os.path.dirname(self.output_file)
+            else ".",
+            exist_ok=True,
+        )
+
+        # Initialize file with header if it doesn't exist
+        if not os.path.exists(self.output_file):
+            with open(self.output_file, "w") as f:
+                f.write("")  # Create empty file
+
+    def collect_batch_stats(self, outputs: List[Dict], batch_id: int) -> None:
+        """Collect statistics from a batch of SGLang outputs
+
+        Args:
+            outputs: List of SGLang output dictionaries
+            batch_id: Unique identifier for this batch
+        """
+        current_time = time.time()
+
+        for req_idx, output in enumerate(outputs):
+            try:
+                # Extract meta_info
+                meta_info = output.get("meta_info", {})
+
+                # Extract the specific metrics you requested
+                stats_record = {
+                    "timestamp": current_time,
+                    "batch_id": batch_id,
+                    "request_id": f"batch_{batch_id}_req_{req_idx}",
+                    "prompt_tokens": meta_info.get("prompt_tokens", None),
+                    "completion_tokens": meta_info.get("completion_tokens", None),
+                    "e2e_latency": meta_info.get("e2e_latency", None),
+                    "ttft": meta_info.get("ttft", None),
+                    # Additional useful meta_info fields (if available)
+                    "finish_reason": meta_info.get("finish_reason", {}).get(
+                        "type", None
+                    ),
+                    "total_tokens": (
+                        meta_info.get("prompt_tokens", 0)
+                        + meta_info.get("completion_tokens", 0)
+                    )
+                    if meta_info.get("prompt_tokens") is not None
+                    and meta_info.get("completion_tokens") is not None
+                    else None,
+                    # Add any other meta_info fields that might be useful
+                    "meta_info_keys": list(
+                        meta_info.keys()
+                    ),  # For debugging/inspection
+                }
+
+                self.stats_buffer.append(stats_record)
+
+            except Exception as e:
+                # Log error but continue processing
+                error_record = {
+                    "timestamp": current_time,
+                    "batch_id": batch_id,
+                    "request_id": f"batch_{batch_id}_req_{req_idx}",
+                    "error": str(e),
+                    "output_keys": list(output.keys())
+                    if isinstance(output, dict)
+                    else "not_dict",
+                }
+                self.stats_buffer.append(error_record)
+
+        # Write to file if buffer is full
+        if len(self.stats_buffer) >= self.buffer_size:
+            self._flush_to_file()
+
+    def _flush_to_file(self) -> None:
+        """Write buffered statistics to file"""
+        if not self.stats_buffer:
+            return
+
+        with open(self.output_file, "a") as f:
+            for record in self.stats_buffer:
+                f.write(json.dumps(record) + "\n")
+
+        print(f"Written {len(self.stats_buffer)} records to {self.output_file}")
+        self.stats_buffer = []
+
+    def finalize(self) -> None:
+        """Flush any remaining data and close"""
+        self._flush_to_file()
+        print(f"Finalized stats collection. Data saved to {self.output_file}")
