@@ -15,20 +15,26 @@
 import asyncio
 import inspect
 import math
+import time
 from logging import Logger
-from typing import Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 from omegaconf import DictConfig
 
 from rlinf.scheduler import Channel
 from rlinf.scheduler.dynamic_scheduler.utils import (
     RolloutAction,
+    RolloutReport,
     RolloutScheduleInfo,
     get_scheduler_channel,
     get_scheduler_request_queue,
     get_scheduler_response_queue,
 )
 from rlinf.utils.placement import ComponentPlacement
+
+if TYPE_CHECKING:
+    from rlinf.data.io_struct import SeqGroupInfo
+    from rlinf.workers.rollout.sglang.sglang_worker import SGLangWorker
 
 
 class ComponentManager:
@@ -506,9 +512,7 @@ class RolloutManager(ComponentManager):
 
         migrate_out_batches_index = 0
         migrate_out_batches_len = len(migrate_out_batches)
-        migrate_out_tasks = sum(
-            batch.get_running_tasks() for batch in migrate_out_batches
-        )
+        migrate_out_tasks = sum(batch.num_aborted for batch in migrate_out_batches)
         self._logger.info(
             f"[Migrate-Info] migrate_out_batches_len: {migrate_out_batches_len}, migrate_out_tasks={migrate_out_tasks}, self.running_tasks={self.running_tasks}, instance_running_tasks_expected={instance_running_tasks_expected}"
         )
@@ -538,7 +542,7 @@ class RolloutManager(ComponentManager):
                 migrate_batch = migrate_out_batches[migrate_out_batches_index]
                 migrate_in_batches.append(migrate_batch)
                 migrate_out_batches_index += 1
-                running_tasks += migrate_batch.get_running_tasks()
+                running_tasks += migrate_batch.num_aborted
 
             self._logger.info(
                 f"[Migrate-Info] rollout-{rollout_instance_id} migrate_in_batches: {len(migrate_in_batches)}, running_tasks={report.running_tasks} -> {running_tasks} ~= {instance_running_tasks_expected}"
@@ -549,7 +553,7 @@ class RolloutManager(ComponentManager):
             ):
                 migrate_in_batches += migrate_out_batches[migrate_out_batches_index:]
                 running_tasks += sum(
-                    migrate_batch.get_running_tasks()
+                    migrate_batch.num_aborted
                     for migrate_batch in migrate_out_batches[migrate_out_batches_index:]
                 )
                 migrate_out_batches_index = migrate_out_batches_len
@@ -696,6 +700,7 @@ class InferenceManager(ComponentManager):
 
     async def main_loop_finalize(self):
         """Processing after the last training iteration in main_loop."""
+        await self.main_loop_finished_handler.async_wait()
         assert self.main_loop_finished_handler.done()
 
     async def release_resource(
@@ -868,3 +873,134 @@ def create_component_manager(
     elif component_role == "inference":
         return InferenceManager(**component_manager_kwargs)
     raise ValueError(f"can't find ComponentManager subclass for {component_role}")
+
+
+class RolloutScalingScheduler:
+    """Manage communication and lifecycle transitions for a rollout instance that participates in a centralized scheduling system.
+
+    This class encapsulates the asynchronous logic required for a rollout instance
+    to report progress, accept new workload (migrate in), release workload
+    (migrate out), wait for completion, and notify the scheduler when it is
+    offloaded. It interfaces with:
+    - a scheduler_channel for sending/receiving RolloutScheduleInfo messages,
+    - a per-instance request/response queue, and
+    - the worker and its status_manager which track and manage locally running
+        sequence-group generation tasks.
+    """
+
+    def __init__(
+        self,
+        rank: int,
+        scheduler_channel: Channel,
+        worker: "SGLangWorker",
+    ):
+        """Initialize the dynamic scheduler manager.
+
+        Args:
+            rank (int): The rank of the rollout instance.
+            scheduler_channel (Channel): The channel for communication with the scheduler.
+            worker (SGLangWorker): The rollout worker instance.
+        """
+        self._rank = rank
+        self.scheduler_channel = scheduler_channel
+        self.scheduler_request_queue = get_scheduler_request_queue(self._rank)
+        self.scheduler_response_queue = get_scheduler_response_queue(self._rank)
+        self.worker = worker
+        self.status_manager = self.worker.status_manager
+
+    async def _report(self):
+        report = RolloutReport(
+            total_requests=self.status_manager.num_seq_group,
+            completed_requests=self.status_manager.num_seq_group_done,
+            total_tasks=self.status_manager.num_seq,
+            completed_tasks=self.status_manager.num_seq_returned,
+            running_tasks=self.status_manager.num_seq_running,
+            timestamp=time.time(),
+        )
+        scheduler_response = RolloutScheduleInfo(instance_id=self._rank, report=report)
+        await self.scheduler_channel.put(
+            scheduler_response,
+            queue_name=self.scheduler_response_queue,
+            async_op=True,
+        ).async_wait()
+
+    async def _migrate_out(self):
+        await self.worker.abort_generation()
+        await self._wait_until_no_running_task()
+
+        assert self.status_manager.num_seq_group_running == 0
+        assert self.status_manager.num_seq_running == 0
+        scheduler_response = RolloutScheduleInfo(
+            instance_id=self._rank, data=self.status_manager.get_aborted_seq_groups()
+        )
+        await self.scheduler_channel.put(
+            scheduler_response,
+            queue_name=self.scheduler_response_queue,
+            async_op=True,
+        ).async_wait()
+
+        # Notify rollout() to exit.
+        self.status_manager.notify()
+
+    async def _migrate_in(self, scheduler_request: RolloutScheduleInfo):
+        seq_groups: List["SeqGroupInfo"] = scheduler_request.data
+        if self.status_manager.num_seq_group_running == 0:
+            # When migrate_in happens, if there is no running task, rollout() will
+            # be waiting for a notification, we need to notify it to continue.
+            # Otherwise, rollout() will continue to run until all tasks are done.
+            self.status_manager.notify()
+        for group in seq_groups:
+            task = asyncio.create_task(self.worker._async_generate_group(group))
+            self.status_manager.add_task(group, task)
+
+    async def _wait_for_finish(self):
+        await self._wait_until_no_running_task()
+        self.status_manager.notify()
+
+    async def _wait_until_no_running_task(self):
+        # After rollout() launches tasks initially, only migrate_in can increase num_seq_group_running.
+        # migrate_in will not be called concurrently with other RolloutScalingScheduler methods,
+        # so num_seq_group_running will not increase between the return of this coroutine and when the caller regains control.
+        while self.status_manager.num_seq_group_running > 0:
+            await asyncio.sleep(0.1)
+
+    async def report_offloaded(self):
+        """Report that this rollout instance has been offloaded."""
+        scheduler_response = RolloutScheduleInfo(
+            instance_id=self._rank, action=RolloutAction.Offloaded
+        )
+        await self.scheduler_channel.put(
+            scheduler_response,
+            queue_name=self.scheduler_response_queue,
+            async_op=True,
+        ).async_wait()
+
+    async def main_loop(self):
+        """Asynchronous main loop for processing scheduler requests.
+
+        This coroutine runs an infinite event loop that waits for RolloutScheduleInfo
+        requests from the scheduler_channel and dispatches handling based on the
+        RolloutAction contained in each request. It is intended to be run as a
+        background task and will only terminate if cancelled or if an unhandled
+        exception is raised.
+        """
+        while True:
+            request: RolloutScheduleInfo = await self.scheduler_channel.get(
+                queue_name=self.scheduler_request_queue, async_op=True
+            ).async_wait()
+            if request.action != RolloutAction.Report:
+                self.worker.log_info(
+                    f"Received scheduler request action: {request.action}"
+                )
+
+            match request.action:
+                case RolloutAction.Report:
+                    await self._report()
+                case RolloutAction.Migrate_In:
+                    await self._migrate_in(request)
+                case RolloutAction.Migrate_Out:
+                    await self._migrate_out()
+                case RolloutAction.Wait_For_Finish | RolloutAction.Finish:
+                    await self._wait_for_finish()
+                case _:
+                    raise ValueError(f"Unknown scheduler action: {request.action}")

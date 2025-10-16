@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import copyreg
 import gc
 import time
@@ -24,6 +25,7 @@ import torch
 from omegaconf import DictConfig
 from torch.utils.tensorboard import SummaryWriter
 
+from rlinf.data.io_struct import SeqGroupInfo
 from rlinf.scheduler.worker.worker import Worker
 from rlinf.utils.placement import ModelParallelComponentPlacement, PlacementMode
 
@@ -559,18 +561,113 @@ def get_rollout_backend_worker(
         else:
             raise ValueError(f"Unsupported placement mode: {placement.placement_mode}")
     elif rollout_backend == "sglang":
-        from rlinf.workers.rollout.sglang.sglang_worker import (
-            AsyncSGLangWorker,
-            SGLangWorker,
-            UnifySGLangWorker,
+        from rlinf.workers.rollout.sglang.sglang_worker import SGLangWorker
+
+        return SGLangWorker
+
+
+class RunningStatusManager:
+    def __init__(self):
+        self._running_seq_group: Dict[SeqGroupInfo, asyncio.Task] = {}
+        self._aborted_seq_group: List[SeqGroupInfo] = []
+        # SeqGroupInfo that have been completed and sent to actor/inference
+        # only retained for debugging
+        self._done_seq_group: List[SeqGroupInfo] = []
+
+        # asyncio Events
+        # set by scheduler coroutine to prevent rollout coroutine from exiting before potential migrations
+        self.exit_rollout_iter = asyncio.Event()
+
+    def add_task(self, seq_group: SeqGroupInfo, task: asyncio.Task):
+        assert seq_group not in self._running_seq_group, (
+            f"Task for sequence group {seq_group.id} is already running."
+        )
+        self._running_seq_group[seq_group] = task
+
+    def mark_done(self, seq_group: SeqGroupInfo):
+        assert seq_group in self._running_seq_group, (
+            f"Task for SeqGroup {seq_group.id} not found. "
+            "Check whether it has been added correctly or already marked done."
+        )
+        assert seq_group not in self._done_seq_group
+        self._running_seq_group.pop(seq_group)
+        self._done_seq_group.append(seq_group)
+
+    def mark_aborted(self, seq_group: SeqGroupInfo):
+        assert seq_group in self._running_seq_group, (
+            f"Task for SeqGroup {seq_group.id} not found. "
+            "Check whether it has been added correctly or already marked aborted."
+        )
+        assert seq_group not in self._aborted_seq_group
+        self._running_seq_group.pop(seq_group)
+        self._aborted_seq_group.append(seq_group)
+
+    async def wait_notification(self):
+        """
+        Wait until the scheduler notifies that it is safe to continue.
+        This is used to prevent the rollout coroutine from exiting before potential migrations.
+        """
+        await self.exit_rollout_iter.wait()
+        self.exit_rollout_iter.clear()
+
+    def notify(self):
+        """
+        Call by scheduler to notify the rollout to continue.
+        This is used to prevent the rollout coroutine from exiting before potential migrations.
+        """
+        self.exit_rollout_iter.set()
+
+    def clear(self):
+        self._running_seq_group.clear()
+        self._aborted_seq_group.clear()
+        self._done_seq_group.clear()
+        self.exit_rollout_iter.clear()
+
+    def empty(self) -> bool:
+        return len(self._running_seq_group) == 0 and len(self._done_seq_group) == 0
+
+    def get_running_seq_groups(self) -> list[SeqGroupInfo]:
+        return list(self._running_seq_group.keys())
+
+    def get_done_seq_groups(self) -> list[SeqGroupInfo]:
+        return self._done_seq_group
+
+    def get_aborted_seq_groups(self) -> list[SeqGroupInfo]:
+        return self._aborted_seq_group
+
+    def get_running_tasks(self) -> list[asyncio.Task]:
+        return list(self._running_seq_group.values())
+
+    @property
+    def num_seq_group_running(self) -> int:
+        return len(self._running_seq_group)
+
+    @property
+    def num_seq_group_done(self) -> int:
+        return len(self._done_seq_group)
+
+    @property
+    def num_seq_group_aborted(self) -> int:
+        return len(self._aborted_seq_group)
+
+    @property
+    def num_seq_group(self) -> int:
+        return (
+            self.num_seq_group_running
+            + self.num_seq_group_done
+            + self.num_seq_group_aborted
         )
 
-        if placement.placement_mode == PlacementMode.COLLOCATED:
-            return UnifySGLangWorker
-        elif placement.placement_mode in [
-            PlacementMode.DISAGGREGATED,
-            PlacementMode.AUTO,
-        ]:
-            return AsyncSGLangWorker
-        else:
-            raise ValueError(f"Unsupported placement mode: {placement.placement_mode}")
+    @property
+    def num_seq_running(self) -> int:
+        return sum(sg.num_running for sg in self.get_running_seq_groups())
+
+    @property
+    def num_seq_returned(self) -> int:
+        return self.num_seq - self.num_seq_running
+
+    @property
+    def num_seq(self) -> int:
+        return sum(sg.group_size for sg in self.get_running_seq_groups()) + sum(
+            sg.group_size for sg in self.get_done_seq_groups()
+        )

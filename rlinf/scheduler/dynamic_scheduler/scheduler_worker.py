@@ -144,6 +144,10 @@ class SchedulerWorker(Worker):
                 assert released_gpu_num == 0 or incremental_gpu_num == 0
 
                 available_gpu_num += released_gpu_num - incremental_gpu_num
-                resource_info += f"{component} : released_gpu_num = {released_gpu_num}, incremental_gpu_num={incremental_gpu_num} => available_gpu_num={available_gpu_num}\n"
+                resource_info += (
+                    f"{component} : released_gpu_num = {released_gpu_num}, "
+                    f"incremental_gpu_num={incremental_gpu_num} => "
+                    f"available_gpu_num={available_gpu_num}\n"
+                )
 
             self.log_info(resource_info)
