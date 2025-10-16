@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -56,6 +58,60 @@ class RolloutRequest:
     input_ids: List[List[int]]
     answers: List[str]
 
+    def repeat(self) -> "RolloutRequest":
+        """Repeat each input in the RolloutRequest a specified number of times.
+
+        Args:
+            times (int): The number of times to repeat each input.
+
+        Returns:
+            RolloutRequest: A new RolloutRequest with repeated inputs.
+        """
+        assert self.n > 0, "n must be greater than 0"
+
+        input_ids, answers = zip(
+            *[
+                (input_id, answer)
+                for input_id, answer in zip(self.input_ids, self.answers)
+                for _ in range(self.n)
+            ]
+        )
+        return RolloutRequest(
+            n=self.n,
+            input_ids=list(input_ids),
+            answers=list(answers),
+        )
+
+    def split(self, num_splits: int) -> List["RolloutRequest"]:
+        """Split the RolloutRequest into multiple smaller requests.
+
+        Args:
+            num_splits (int): The number of splits to create.
+
+        Returns:
+            List[RolloutRequest]: A list of smaller RolloutRequest instances.
+        """
+        assert num_splits > 0, "num_splits must be greater than 0"
+        assert len(self.input_ids) % num_splits == 0, (
+            f"Input IDs length {len(self.input_ids)} is not divisible by num_splits {num_splits}"
+        )
+
+        input_ids_split_list = split_list(self.input_ids, num_splits)
+        answers_split_list = split_list(self.answers, num_splits)
+
+        splitted_requests = []
+        for input_ids_batch, answers_batch in zip(
+            input_ids_split_list, answers_split_list
+        ):
+            request = RolloutRequest(
+                n=self.n,
+                input_ids=input_ids_batch,
+                answers=answers_batch,
+            )
+            splitted_requests.append(request)
+
+        return splitted_requests
+
     def repeat_and_split(
         self, rollout_batch_size: Optional[int] = None
     ) -> List["RolloutRequest"]:
@@ -92,6 +148,127 @@ class RolloutRequest:
             splitted_requests.append(request)
 
         return splitted_requests
+
+    def to_seq_group_infos(self) -> List["SeqGroupInfo"]:
+        """Convert the RolloutRequest into a list of SeqGroupInfo objects.
+
+        Returns:
+            List[SeqGroupInfo]: A list of SeqGroupInfo objects.
+        """
+        return [
+            SeqGroupInfo(
+                id=uuid.uuid4().int,
+                input_ids=input_ids,
+                answer=answers,
+                group_size=self.n,
+            )
+            for input_ids, answers in zip(self.input_ids, self.answers, strict=True)
+        ]
+
+
+class FinishReasonEnum(StrEnum):
+    ABORT = "abort"
+    STOP = "stop"
+    LENGTH = "length"
+
+
+@dataclass
+class SeqGroupInfo:
+    """
+    SeqGroupInfo represents a group of sequences and tracks their processing status and results.
+
+    Each SeqGroupInfo instance corresponds to a single input sequence that is expanded into `group_size` sequences
+
+    Attributes:
+        id (int): Unique identifier for the sequence group.
+        input_ids (List[int]): List of input IDs of the original sequence.
+        answer (List[str]): List of answers of the original sequence.(One sequence can have multiple equivalent answers)
+        group_size (int): Number of sequences in the group.
+        idx_completed (set[int]): Set of indices for sequences that have completed rollout and are ready for evaluation.
+        idx_aborted (set[int]): Set of indices for sequences that have been aborted. These sequences need to be re-rolled out before they can be evaluated.
+        results (List[Optional[Dict]]): List storing result dictionaries for each sequence, or None if not yet available.
+
+    Methods:
+        record_sglang_result(idx: int, result: Dict):
+            Records the result for a sequence at the given index.
+            Updates completion or abortion status based on the result's finish reason.
+            Handles overwriting of existing results and concatenates output IDs if necessary.
+
+        num_completed (int):
+            Returns the number of completed sequences.
+
+        num_aborted (int):
+            Returns the number of aborted sequences.
+
+        num_returned (int):
+            Returns the total number of sequences that have either completed or aborted.
+
+        num_running (int):
+            Returns the number of sequences still running.
+
+        all_returned (bool):
+            Returns True if all sequences have either completed or aborted.
+
+        all_completed (bool):
+            Returns True if all sequences have completed.
+    """
+
+    id: int
+    input_ids: List[int]
+    answer: List[str]
+    group_size: int
+    idx_completed: set[int] = field(init=False, compare=False)
+    idx_aborted: set[int] = field(init=False, compare=False)
+    results: List[Optional[Dict]] = field(init=False, compare=False)
+
+    def __post_init__(self):
+        assert self.group_size > 0, "group_size must be greater than 0"
+        self.idx_completed = set()
+        self.idx_aborted = set()
+        self.results = [None for _ in range(self.group_size)]
+
+    def record_sglang_result(self, idx: int, result: Dict, logger=None):
+        finished_reason = result["meta_info"]["finish_reason"]["type"]
+        match finished_reason:
+            case FinishReasonEnum.ABORT:
+                self.idx_aborted.add(idx)
+            case FinishReasonEnum.STOP | FinishReasonEnum.LENGTH:
+                self.idx_completed.add(idx)
+            case _:
+                raise ValueError(f"Unknown finish reason: {finished_reason}")
+        if self.results[idx] is None:
+            self.results[idx] = result
+        else:
+            prev_output_ids = self.results[idx]["output_ids"]
+            self.results[idx] = result
+            self.results[idx]["output_ids"] = prev_output_ids + result["output_ids"]
+
+    def __hash__(self):
+        return self.id
+
+    @property
+    def num_completed(self) -> int:
+        return len(self.idx_completed)
+
+    @property
+    def num_aborted(self) -> int:
+        return len(self.idx_aborted)
+
+    @property
+    def num_returned(self) -> int:
+        return self.num_completed + self.num_aborted
+
+    @property
+    def num_running(self) -> int:
+        return self.group_size - self.num_returned
+
+    @property
+    def all_returned(self) -> bool:
+        return self.num_returned == self.group_size
+
+    @property
+    def all_completed(self) -> bool:
+        return self.num_completed == self.group_size
 
 
 class CompletionInfo:

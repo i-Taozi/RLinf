@@ -14,7 +14,10 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List
+from typing import TYPE_CHECKING, List
+
+if TYPE_CHECKING:
+    from rlinf.data.io_struct import SeqGroupInfo
 
 
 def get_valid_dp_sizes(cfg, total_gpus, model_parallel_size_with_cp) -> List[int]:
@@ -103,6 +106,6 @@ class RolloutScheduleInfo:
     """Rollout schedule info."""
 
     instance_id: int = -1
-    data: List[RolloutMigrateBatch] = None
+    data: List["SeqGroupInfo"] = None
     report: RolloutReport = None
     action: RolloutAction = RolloutAction.Default

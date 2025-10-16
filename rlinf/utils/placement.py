@@ -369,12 +369,20 @@ class ModelParallelComponentPlacement(ComponentPlacement):
                 )
 
     @property
+    def is_collocated(self):
+        return self._placement_mode == PlacementMode.COLLOCATED
+
+    @property
     def is_disaggregated(self):
         return self._placement_mode == PlacementMode.DISAGGREGATED
 
     @property
+    def is_auto(self):
+        return self._placement_mode == PlacementMode.AUTO
+
+    @property
     def is_pipeline(self):
-        return self.is_disaggregated or self._placement_mode == PlacementMode.AUTO
+        return self.is_disaggregated or self.is_auto
 
     @property
     def has_dedicated_inference(self):
