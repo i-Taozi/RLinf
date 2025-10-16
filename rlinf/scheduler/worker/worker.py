@@ -678,7 +678,6 @@ class Worker(metaclass=WorkerMeta):
     def log_on_first_rank(self, msg):
         """Log a message only on the first rank of the worker group."""
         if self._rank == 0:
-            self._logger.info(f"{self._rank=}", stacklevel=self._stacklevel)
             self._logger.info(msg, stacklevel=self._stacklevel)
 
     def log_on_last_rank(self, msg):
