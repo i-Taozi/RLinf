@@ -700,7 +700,6 @@ class InferenceManager(ComponentManager):
 
     async def main_loop_finalize(self):
         """Processing after the last training iteration in main_loop."""
-        await self.main_loop_finished_handler.async_wait()
         assert self.main_loop_finished_handler.done()
 
     async def release_resource(

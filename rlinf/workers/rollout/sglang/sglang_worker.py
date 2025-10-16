@@ -14,7 +14,6 @@
 
 import asyncio
 import dataclasses
-import time
 from typing import Dict, List
 
 import torch
@@ -93,10 +92,6 @@ class SGLangWorker(Worker):
         self._scheduler = RolloutScalingScheduler(
             self._rank, self.schedule_channel, self
         )
-
-        # Initialize report progress
-        self.progress_report_interval = 1.0  # seconds
-        self.last_progress_report = time.time()
 
     def _init_meta_stats_collector(self):
         async_stats_file = getattr(
