@@ -52,7 +52,7 @@ class SGLangWorker(Worker):
         self._tokenizer = AutoTokenizer.from_pretrained(self._cfg.rollout.model_dir)
         self._eos = self._cfg.rollout.eos or self._tokenizer.eos_token_id
         self._return_logprobs = self._cfg.rollout.return_logprobs
-        self._sampling_params = self.get_sampling_param_from_config(self._cfg)
+        self._sampling_params = SGLangWorker.get_sampling_param_from_config(self._cfg)
         if self._cfg.algorithm.rollout_batch_size_per_gpu is None:
             self._rollout_batch_size = None
         else:

@@ -66,11 +66,6 @@ class Scheduler(_Scheduler):
             ]
         )
 
-        # it's important to use load_weight to load resharded weight from megatron
-        for _, module in self.tp_worker.worker.model_runner.model.named_modules():
-            if hasattr(module, "use_presharded_weights"):
-                module.use_presharded_weights = True
-
         self.is_weight_offloaded = False
 
     def cuda_info(self, text: str = ""):
@@ -189,6 +184,14 @@ class Scheduler(_Scheduler):
         self.actor_weight_rank = RankMapper.get_rollout_rank_to_actor_rank_map(
             placement
         )[(self._rlinf_worker.get_parent_rank(), self._rlinf_worker._rank)]
+
+        use_presharded_weights = (
+            False if self.cfg.actor.training_backend == "fsdp" else True
+        )
+        # it's important to use load_weight to load resharded weight from megatron
+        for _, module in self.tp_worker.worker.model_runner.model.named_modules():
+            if hasattr(module, "use_presharded_weights"):
+                module.use_presharded_weights = use_presharded_weights
 
         self._rlinf_worker.log_info(
             f"Running Scheduler dp rank {self._rlinf_worker.get_parent_rank()}, tp rank {self.tp_rank}, corresponding actor weight rank = {self.actor_weight_rank}"
