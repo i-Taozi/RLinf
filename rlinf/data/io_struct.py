@@ -14,7 +14,7 @@
 
 import uuid
 from dataclasses import dataclass, field
-from enum import StrEnum, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -210,7 +210,11 @@ class RolloutRequest:
                 multi_modal_inputs=multi_modal_inputs,
             )
             for input_ids, answers, image_data, multi_modal_inputs in zip(
-                self.input_ids, self.answers, self.image_data, self.multi_modal_inputs, strict=True
+                self.input_ids,
+                self.answers,
+                self.image_data,
+                self.multi_modal_inputs,
+                strict=True,
             )
         ]
 
@@ -342,55 +346,20 @@ class CompletionInfo:
 
         self.logger = logger
 
-    def hash(self, token_ids: List[int]) -> int:
-        """Generate a hash for the token IDs."""
-        return hash(tuple(token_ids))
-
-    def clear(self):
-        self.complete_num.clear()
-        self.input_ids.clear()
-        self.results.clear()
-        self.num_requests = 0
-        self.num_completed = 0
-        self._num_returned = 0
-
-    def add_request(self, req: RolloutRequest):
-        """Add a new request to the completion info."""
-        if self.n_result_each_request != 0:
-            assert self.n_result_each_request == req.n
-        else:
-            self.n_result_each_request = req.n
-
-        self.num_requests += len(req.input_ids)
-
-        for ids in req.input_ids:
-            hash_id = self.hash(ids)
-            if hash_id not in self.input_ids:
-                self.input_ids[hash_id] = ids
-                self.complete_num[hash_id] = 0
-                self.results[hash_id] = []
-            else:
-                assert self.input_ids[hash_id] == ids, (
-                    "Input IDs mismatch for existing hash ID"
-                )
-
-    def clear_and_set(self, req: RolloutRequest):
-        self.clear()
-        self.add_request(req)
-
     def is_empty(self) -> bool:
-        return len(self.complete_num) == 0 and len(self.results) == 0
+        return len(self.results) == 0
 
-    def record_result(self, token_ids: List[int], result: Dict) -> int:
-        hash_id = self.hash(token_ids)
+    def record_result(self, unique_id: int, result: Dict) -> int:
+        # only in ["abort", "stop", "length"]
+        finished_reason = result["meta_info"]["finish_reason"]["type"]
+        self.complete_num[unique_id] += 1
+        if finished_reason == "abort":
+            self.abort_results[unique_id].append(result)
+        else:
+            self.results[unique_id].append(result)
 
-        self.complete_num[hash_id] += 1
-        self.results[hash_id].append(result)
-
-        if self.complete_num[hash_id] == self.n_result_each_request:
-            self.num_completed += 1
-            if self.logger is not None:
-                self.logger.debug(f"Completed all rollouts for hash: {hash_id}")
+            if len(self.results[unique_id]) == self.n_result_each_request:
+                self.num_completed += 1
 
         return len(self.results[unique_id])
 

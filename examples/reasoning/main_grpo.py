@@ -21,10 +21,9 @@ from omegaconf.omegaconf import OmegaConf
 from rlinf.config import validate_cfg
 from rlinf.data.datasets import create_rl_dataset
 from rlinf.data.tokenizers import hf_tokenizer
+from rlinf.runners.reasoning_runner import ReasoningRunner
 from rlinf.scheduler import Cluster, NodePlacementStrategy
 from rlinf.scheduler.dynamic_scheduler.scheduler_worker import SchedulerWorker
-from rlinf.runners.reasoning_runner import ReasoningRunner
-from rlinf.scheduler import Cluster
 from rlinf.utils.placement import ModelParallelComponentPlacement, PlacementMode
 from rlinf.utils.utils import output_redirector
 from rlinf.workers.actor import get_actor_worker

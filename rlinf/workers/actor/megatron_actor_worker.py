@@ -14,7 +14,7 @@
 
 import copy
 from functools import partial
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 import torch.distributed
