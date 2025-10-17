@@ -21,12 +21,6 @@ RLinf 支持多种后端引擎，用于训练和推理。目前支持以下配�
 
    - **Huggingface**：简单易用，配套 Huggingface 生态提供的原生 API。
 
-安装方式
---------------------
-
-RLinf 提供两种安装方式。我们 **推荐使用 Docker**，因为这可以提供最快速、最可复现的环境。  
-如果你的系统无法使用 Docker 镜像，也可以选择在本地 Python 环境中手动安装。
-
 硬件要求
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -70,19 +64,25 @@ RLinf 提供两种安装方式。我们 **推荐使用 Docker**，因为这可�
    * - NVIDIA Container Toolkit
      - 1.17.8
 
-使用 Docker 镜像安装
+
+安装方式
+--------------------
+
+RLinf 提供两种安装方式。我们 **推荐使用 Docker**，因为这可以提供最快速、最可复现的环境。  
+如果你的系统无法使用 Docker 镜像，也可以选择在本地 Python 环境中手动安装。
+
+安装方式1： Docker 镜像
 -------------------------
 
 我们提供了两个官方镜像，分别针对不同后端配置进行了优化：
 
-- **Megatron + SGLang/vLLM**：
+- **基于Megatron + SGLang/vLLM的数学推理镜像**：
 
   - ``rlinf/rlinf:math-rlinf0.1-torch2.5.1-sglang0.4.4-vllm0.7.1-megatron0.11.0-te2.1`` （用于增强大语言模型在 MATH 任务中的推理能力）
 
-- **FSDP + Huggingface**：
+- **基于FSDP + Huggingface的具身智能镜像**：
 
-  - ``rlinf/rlinf:agentic-openvla-rlinf0.1-torch2.5.1`` （适用于 OpenVLA 模型）  
-  - ``rlinf/rlinf:agentic-openvlaoft-rlinf0.1-torch2.5.1`` （适用于 OpenVLA-OFT 模型）
+  - ``rlinf/rlinf:agentic-rlinf0.1-torch2.6.0-openvla-openvlaoft-pi0`` （适用于 OpenVLA/OpenVLA-OFT/OpenPI 模型）
 
 确认适合你任务的镜像后，拉取镜像：
 
@@ -97,7 +97,6 @@ RLinf 提供两种安装方式。我们 **推荐使用 Docker**，因为这可�
    docker run -it --gpus all \
       --shm-size 100g \
       --net=host \
-      --env NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
       --name rlinf \
       rlinf/rlinf:CHOSEN_IMAGE /bin/bash
 
@@ -108,23 +107,34 @@ RLinf 提供两种安装方式。我们 **推荐使用 Docker**，因为这可�
    git clone https://github.com/RLinf/RLinf.git
    cd RLinf
 
+具身智能镜像中包含多个 Python 虚拟环境（venv），位于 ``/opt/venv`` 目录下，分别对应不同模型，即 ``openvla``、``openvla-oft`` 和 ``openpi``。
+默认环境设置为 ``openvla``。
+要切换到所需的 venv，可以使用内置脚本 `switch_env`：
+
+.. code-block:: bash
+
+   source switch_env <env_name>
+   # source switch_env openvla
+   # source switch_env openvla-oft
+   # source switch_env openpi
+
 .. tip::
 
    如果进行多节点训练，请将仓库克隆到共享存储路径，确保每个节点都能访问该代码。
 
-自定义环境安装
+安装方式2：UV 自定义环境
 -------------------------------
+**如果你已经使用了 Docker 镜像，下面步骤可跳过。**
 
-根据你的实验类型，安装分为三步进行：
+根据你的实验类型，安装分为两步进行：
 
-第一步，对于所有实验，请先完成 :ref:`共同依赖 <common-dependencies>` 中的依赖安装，  
-这一步已经包括了 **FSDP + Huggingface** 的完整配置。
+第一步，对于所有实验类型，请先完成 :ref:`共同依赖 <common-dependencies>` 中的依赖安装。
 
-第二步，如果你的实验使用的是 **Megatron 和 SGLang/vLLM** 后端，  
-请参考 :ref:`Megatron 及 SGLang/vLLM 依赖 <megatron-and-sglang-vllm-dependencies>` 安装相应依赖。
+第二步，根据你的实验类型，安装对应的依赖。  
 
-第三步，如果你要运行具身智能相关实验（如 OpenVLA、OpenVLA-OFT、Pi0），  
-请参考 :ref:`具身智能依赖 <embodied-dependencies>` 安装专用依赖项。
+* 如果你要运行数学推理实验，需要安装 **Megatron 和 SGLang/vLLM** 后端，请参考 :ref:`Megatron 和 SGLang/vLLM 依赖 <megatron-and-sglang-vllm-dependencies>` 安装相应依赖。
+
+* 如果你要运行具身智能相关实验（如 OpenVLA、OpenVLA-OFT、openpi），请参考 :ref:`具身智能相关依赖 <embodied-dependencies>` 安装专用依赖项。
 
 .. _common-dependencies:
 
@@ -153,31 +163,23 @@ RLinf 提供两种安装方式。我们 **推荐使用 Docker**，因为这可�
 Megatron 和 SGLang/vLLM 依赖
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+.. note::
+  如果你运行的是具身智能实验，则无需安装这些依赖。  
+  请直接跳转到 :ref:`具身智能相关依赖 <embodied-dependencies>` 部分。
+
 运行以下命令，安装 Megatron、SGLang/vLLM 及其所需依赖：
 
 .. code-block:: shell
 
-   uv sync --extra sgl_vllm
+   uv sync --extra sglang-vllm
    mkdir -p /opt && git clone https://github.com/NVIDIA/Megatron-LM.git -b core_r0.13.0 /opt/Megatron-LM
-   APEX_CPP_EXT=1 APEX_CUDA_EXT=1 uv pip install -r requirements/megatron.txt --no-build-isolation
+   APEX_CPP_EXT=1 APEX_CUDA_EXT=1 NVCC_APPEND_FLAGS="--threads 24" APEX_PARALLEL_BUILD=24 uv pip install -r requirements/megatron.txt --no-build-isolation
 
 使用 Megatron 前，请将其路径加入 ``PYTHONPATH`` 环境变量：
 
 .. code-block:: shell
 
    export PYTHONPATH=/opt/Megatron-LM:$PYTHONPATH
-
-SGLang 安装：
-
-.. code-block:: shell
-
-   uv sync --extra sglang
-
-vLLM 安装：
-
-.. code-block:: shell
-
-   uv sync --extra vllm
 
 .. _embodied-dependencies:
 
@@ -188,15 +190,33 @@ vLLM 安装：
 
 .. code-block:: shell
 
-   bash requirements/install_embodied_deps.sh
    uv sync --extra embodied
+   bash requirements/install_embodied_deps.sh # 必须在上述命令后运行
 
 接着，根据具体实验类型安装对应的 Python 包：
 
 .. code-block:: shell
 
-   # OpenVLA / OpenVLA-OFT 实验所需依赖
+   # OpenVLA 实验所需依赖
    UV_TORCH_BACKEND=auto uv pip install -r requirements/openvla.txt --no-build-isolation
 
-   # Pi0 实验所需依赖
-   UV_TORCH_BACKEND=auto uv pip install -r requirements/pi0.txt --no-build-isolation
+   # OpenVLA-oft 实验所需依赖
+   UV_TORCH_BACKEND=auto uv pip install -r requirements/openvla_oft.txt --no-build-isolation
+
+   # openpi 实验所需依赖
+   # For openpi experiment
+   UV_TORCH_BACKEND=auto GIT_LFS_SKIP_SMUDGE=1 uv pip install -r requirements/openpi.txt
+   cp -r .venv/lib/python3.11/site-packages/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/
+   TOKENIZER_DIR=/root/.cache/openpi/big_vision/ && mkdir -p $TOKENIZER_DIR && gsutil -m cp -r gs://big_vision/paligemma_tokenizer.model $TOKENIZER_DIR
+
+最后，运行以下命令安装 LIBERO 依赖。
+
+.. code-block:: shell
+
+  mkdir -p /opt && git clone https://github.com/RLinf/LIBERO.git /opt/libero
+
+在使用 LIBERO 前，请确保将其路径添加到 ``PYTHONPATH`` 环境变量中：
+
+.. code-block:: shell
+
+  export PYTHONPATH=/opt/libero:$PYTHONPATH

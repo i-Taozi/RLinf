@@ -44,6 +44,11 @@ dependencies = [
     "pybind11",
     "torch-memory-saver",
     "setuptools>=69.5.1,<75.9",
+    "ninja",
+    "pytest",
+    "gsutil",
+    "ruff",
+    "pre-commit",
 
     # Logging
     "swanlab",
@@ -51,12 +56,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-sglang = [
+sglang-vllm = [
     "transformers==4.51.1",
     "sglang[all]==0.4.6.post5",
-]
-vllm = [
-    "transformers==4.51.1",
     "vllm==0.8.5",
 ]
 embodied = [
@@ -67,19 +69,31 @@ embodied = [
     "tensorflow_graphics",
     "peft==0.11.1",
     "timm==0.9.10",
+    "sapien==3.0.1;platform_system=='Linux'",
     "mani_skill @ git+https://github.com/haosulab/ManiSkill.git",
     "tensordict",
-    "libero @ git+https://github.com/Lifelong-Robot-Learning/LIBERO.git"
+    "libero @ git+https://github.com/RLinf/LIBERO.git",
+    "imageio[ffmpeg]",
+    "robosuite==1.4.1",
+    "bddl",
+    "easydict",
+    "cloudpickle",
+    "gym",
 ]
 
 [tool.uv]
 prerelease = "allow"
 conflicts = [
     [
-      { extra = "sglang" },
-      { extra = "vllm" },
+      { extra = "sglang-vllm" },
       { extra = "embodied" },
     ],
+]
+override-dependencies = [
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "torchaudio==2.6.0",
+    "xgrammar==0.1.19"
 ]
 
 [tool.ruff]

@@ -14,9 +14,8 @@
 
 import asyncio
 import dataclasses
-from typing import Dict, List
+from typing import Any, Dict, List
 
-import torch
 from omegaconf import DictConfig
 from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
 from sglang.srt.server_args import ServerArgs
@@ -41,7 +40,6 @@ from rlinf.workers.rollout.utils import (
     RunningStatusManager,
     print_sglang_outputs,
 )
-from toolkits.math_verifier.verify import MathRewardModel, math_verify_call
 
 
 class SGLangWorker(Worker):
@@ -54,7 +52,7 @@ class SGLangWorker(Worker):
         self._tokenizer = AutoTokenizer.from_pretrained(self._cfg.rollout.model_dir)
         self._eos = self._cfg.rollout.eos or self._tokenizer.eos_token_id
         self._return_logprobs = self._cfg.rollout.return_logprobs
-        self._sampling_params = self._get_sampling_param_from_config()
+        self._sampling_params = self.get_sampling_param_from_config(self._cfg)
         if self._cfg.algorithm.rollout_batch_size_per_gpu is None:
             self._rollout_batch_size = None
         else:
@@ -71,7 +69,6 @@ class SGLangWorker(Worker):
             "The capital of France is",
             "The future of AI is",
         ]
-        self._reward_model = MathRewardModel(scale=self._cfg.reward.reward_scale)
 
         self.status_manager = RunningStatusManager()
 
@@ -108,11 +105,12 @@ class SGLangWorker(Worker):
         )
         self.async_batch_counter += 1
 
-    def _get_sampling_param_from_config(self) -> dict:
+    @staticmethod
+    def get_sampling_param_from_config(cfg: DictConfig) -> dict:
         """
         Get sampling parameters from the configuration.
         """
-        cfg_sampling_params = self._cfg.algorithm.sampling_params
+        cfg_sampling_params = cfg.algorithm.sampling_params
         if cfg_sampling_params.use_greedy:
             sampling_params = {
                 "temperature": 0,
@@ -209,9 +207,11 @@ class SGLangWorker(Worker):
                 "validate_weight with detokenize=True is not supported yet."
             )
         else:
-            prompt_ids = self._tokenizer(self._validate_prompts).input_ids
-            _, _, engine_results = await self._async_generate(
-                prompt_ids, None, self._validate_sampling_params, False
+            input_ids = self._tokenizer(self._validate_prompts).input_ids
+            engine_results, _ = await self.async_generate(
+                input_ids=input_ids,
+                sampling_params=self._validate_sampling_params,
+                return_logprob=False,
             )
             print_sglang_outputs(
                 self._validate_prompts, engine_results, self._tokenizer
@@ -225,42 +225,43 @@ class SGLangWorker(Worker):
         if not self._placement.is_disaggregated:
             await self.offload_engine()
 
-    def _compute_reward_and_advantage(
-        self, engine_results: List[Dict], answers: List[List[str]]
-    ):
-        texts: List[str] = []
-        for res in engine_results:
-            if hasattr(res, "text"):
-                texts.append(res["text"])
-            else:
-                texts.append(
-                    self._tokenizer.decode(res["output_ids"], skip_special_tokens=True)
-                )
-
-        results = math_verify_call(texts, answers)
-        rewards = [(1 if r else -1) * self._reward_model.scale for r in results]
-        rewards_tensor = torch.tensor(rewards, dtype=torch.float)
-
-        mean = rewards_tensor.mean()
-        std = rewards_tensor.std()
-        advantages = (rewards_tensor - mean) / (std + 1e-6)
-
-        return rewards, advantages.tolist()
-
-    async def _async_generate(
+    async def async_generate(
         self,
-        input_ids: List[List[int]],
-        answers: List[List[str]],
-        sampling_params: dict,
-        return_logprobs: bool,
+        prompt: List[str] | str | None = None,
+        sampling_params: List[Dict] | Dict | None = None,
+        input_ids: List[List[int]] | List[int] | None = None,
+        image_data: List | None = None,
+        return_logprob: List[bool] | bool | None = False,
+        request_info: Any | None = None,
     ):
+        """
+        Asynchronously generate text using the underlying SGLang engine and return
+        the engine result together with the original input_ids, answers, and idx.
+
+        This wrapper calls self._engine.async_generate(...) and forwards the provided
+        arguments. Because the SGLang engine does not include the original input_ids
+        in its response, this method returns the input_ids alongside the engine
+        result for downstream use.
+
+        Args:
+            prompt (List[str] | str | None): Same as SGLang engine's prompt argument.
+            sampling_params (List[Dict] | Dict | None): Same as SGLang engine's sampling_params argument.
+            input_ids (List[List[int]] | List[int] | None): Same as SGLang engine's input_ids argument.
+            return_logprob (List[bool] | bool | None): Same as SGLang engine's return_logprob argument.
+            request_info (Any | None): Any additional request info you wish to be associated with this generation request. This argument will not be passed to the SGLang engine and returned directly.
+
+        Returns:
+            Tuple[Dict, Any, List[List[int]]]: A tuple containing the engine result and the original request_info.
+        """
         result = await self._engine.async_generate(
-            input_ids=input_ids,
+            prompt=prompt,
             sampling_params=sampling_params,
-            return_logprob=return_logprobs,
+            input_ids=input_ids,
+            image_data=image_data if any(image_data) else None,
+            return_logprob=return_logprob,
         )
         # SGLang does not return input_ids, so we need to pass them for further usage.
-        return input_ids, answers, result
+        return result, request_info
 
     async def init_worker(self):
         self._init_engine()
@@ -310,51 +311,56 @@ class SGLangWorker(Worker):
 
         return state
 
-    async def _async_generate_single(
-        self,
-        idx: int,
-        input_ids: List[int],
-        sampling_params: dict,
-        return_logprob: bool,
-    ) -> tuple[int, Dict]:
-        result = await self._engine.async_generate(
-            input_ids=input_ids,
-            sampling_params=sampling_params,
-            return_logprob=return_logprob,
-        )
-        return idx, result
-
     async def _async_generate_group(self, seq_group_info: SeqGroupInfo):
-        if seq_group_info.num_aborted > 0:
-            # migrated sequences need to continue generation
-            seq_idx = seq_group_info.idx_aborted.copy()
+        """Generate a group of responses for a request (for GRPO-like behavior)."""
+        if seq_group_info.num_aborted == 0:
+            # No aborted sequences, repeat the input for group_size times
+            assert seq_group_info.num_returned == 0
+            seq_idx_list = list(range(seq_group_info.group_size))
+            input_batch = [seq_group_info.input_ids] * seq_group_info.group_size
+            sampling_params_list = [self._sampling_params] * seq_group_info.group_size
+            image_data_list = [seq_group_info.image_data] * seq_group_info.group_size
+        else:
+            # Have aborted sequences (e.g., migrated from other engines)
+            # Continue generation for the aborted group
+            seq_idx_list = seq_group_info.idx_aborted.copy()
             seq_group_info.idx_aborted.clear()
             input_batch: List[List[int]] = []
-            sampling_params: List[Dict] = []
-            for idx in seq_idx:
+            sampling_params_list: List[Dict] = []
+            image_data_list: List = []
+            for idx in seq_idx_list:
                 generated_ids: List[int] = seq_group_info.results[idx]["output_ids"]
                 input_batch.append(seq_group_info.input_ids + generated_ids)
                 params = self._sampling_params.copy()
                 params["max_new_tokens"] -= len(generated_ids)
-                sampling_params.append(params)
-        else:
-            # new sequence group
-            assert seq_group_info.num_returned == 0
-            seq_idx = list(range(seq_group_info.group_size))
-            input_batch = [seq_group_info.input_ids] * seq_group_info.group_size
-            sampling_params = [self._sampling_params] * seq_group_info.group_size
+                sampling_params_list.append(params)
+                image_data_list.append(seq_group_info.image_data)
 
         tasks = [
             asyncio.create_task(
-                self._async_generate_single(
-                    idx, input_ids, params, self._return_logprobs
+                self.async_generate(
+                    input_ids=input_ids,
+                    image_data=image_data,
+                    sampling_params=sampling_params,
+                    return_logprob=self._return_logprobs,
+                    request_info={
+                        "seq_idx": seq_idx,
+                    },
                 )
             )
-            for idx, input_ids, params in zip(seq_idx, input_batch, sampling_params)
+            for seq_idx, input_ids, sampling_params, image_data in zip(
+                seq_idx_list,
+                input_batch,
+                sampling_params_list,
+                image_data_list,
+                strict=True,
+            )
         ]
         for future in asyncio.as_completed(tasks):
-            idx, result = await future
-            seq_group_info.record_sglang_result(idx, result, self._logger)
+            result, request_info = await future
+            seq_group_info.record_sglang_result(
+                request_info["seq_idx"], result, self._logger
+            )
 
         return seq_group_info
 
@@ -368,7 +374,7 @@ class SGLangWorker(Worker):
             if self._placement.is_pipeline
             else asyncio.ALL_COMPLETED
         )
-        with output_channel.device_lock, self.worker_timer():
+        with self.device_lock, self.worker_timer():
             num_residual = self.status_manager.num_seq_group
             assert num_residual == 0, (
                 f"There are {num_residual} "
@@ -392,29 +398,15 @@ class SGLangWorker(Worker):
                             group.group_size,
                             [group.input_ids] * group.group_size,
                             [group.answer] * group.group_size,
-                            self._return_logprobs,
+                            image_data=[group.image_data] * group.group_size,
+                            multi_modal_inputs=[group.multi_modal_inputs]
+                            * group.group_size,
+                            return_logprobs=self._return_logprobs,
                         )
-                        # collocated mode will collect all results and send at once at the end
-                        # pipeline mode will send result immediately
                         all_rollout_results.append(rollout_result)
-                        if self._placement.is_pipeline:
-                            (
-                                rewards,
-                                advantages,
-                            ) = await asyncio.to_thread(
-                                self._compute_reward_and_advantage,
-                                group.results,
-                                [group.answer] * group.group_size,
-                            )
-
-                            rollout_result.rewards = torch.tensor(
-                                rewards, dtype=torch.float32
-                            ).reshape(-1, 1)
-                            rollout_result.advantages = advantages
-
-                            await output_channel.put(
-                                item=rollout_result, async_op=True
-                            ).async_wait()
+                        await output_channel.put(
+                            item=rollout_result, async_op=True
+                        ).async_wait()
                         self.status_manager.mark_done(group)
                     else:
                         self.status_manager.mark_aborted(group)
@@ -432,12 +424,6 @@ class SGLangWorker(Worker):
 
             if self._collect_meta_stats:
                 self._collect_stats(all_rollout_results)
-
-            if not self._placement.is_pipeline:
-                rollout_result = RolloutResult.merge_result_list(all_rollout_results)
-                await output_channel.put(
-                    item=rollout_result, async_op=True
-                ).async_wait()
 
             if self._placement.is_collocated or self._placement.is_auto:
                 await self.offload_engine()

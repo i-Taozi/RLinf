@@ -47,11 +47,10 @@ def extract_termination_from_info(info, num_envs, device):
 
 
 class ManiskillEnv(gym.Env):
-    def __init__(self, cfg, rank, world_size, record_metrics=True):
+    def __init__(self, cfg, seed_offset, total_num_processes, record_metrics=True):
         env_seed = cfg.seed
-        self.seed = env_seed + rank
-        self.rank = rank
-        self.world_size = world_size
+        self.seed = env_seed + seed_offset
+        self.total_num_processes = total_num_processes
         self.auto_reset = cfg.auto_reset
         self.use_rel_reward = cfg.use_rel_reward
         self.ignore_terminations = cfg.ignore_terminations
@@ -111,15 +110,12 @@ class ManiskillEnv(gym.Env):
     def _init_reset_state_ids(self):
         self._generator = torch.Generator()
         self._generator.manual_seed(self.seed)
-        self.all_reset_state_ids = torch.randperm(
-            self.total_num_group_envs, generator=self._generator
-        ).to(self.device)
         self.update_reset_state_ids()
 
     def update_reset_state_ids(self):
         reset_state_ids = torch.randint(
             low=0,
-            high=len(self.all_reset_state_ids),
+            high=self.total_num_group_envs,
             size=(self.num_group,),
             generator=self._generator,
         )
@@ -370,8 +366,14 @@ class ManiskillEnv(gym.Env):
         image = self.render(infos, rewards)
         self.render_images.append(image)
 
+    def add_new_frames_from_obs(self, raw_obs):
+        """For debugging render"""
+        raw_imgs = common.to_numpy(raw_obs["images"].permute(0, 2, 3, 1))
+        raw_full_img = tile_images(raw_imgs, nrows=int(np.sqrt(self.num_envs)))
+        self.render_images.append(raw_full_img)
+
     def flush_video(self, video_sub_dir: Optional[str] = None):
-        output_dir = os.path.join(self.video_cfg.video_base_dir, f"rank_{self.rank}")
+        output_dir = os.path.join(self.video_cfg.video_base_dir, f"seed_{self.seed}")
         if video_sub_dir is not None:
             output_dir = os.path.join(output_dir, f"{video_sub_dir}")
         images_to_video(

@@ -48,6 +48,9 @@ class VLLMWorker(_VllmInnerWorker):
         )
         # rlinf specific
         self.rlinf_config = rlinf_config
+        self.using_sharded_weight = (
+            False if self.rlinf_config.actor.training_backend == "fsdp" else True
+        )
         self._rlinf_worker = _RLinfWorker(
             parent_address=parent_address,
             world_size=vllm_config.parallel_config.world_size,
@@ -82,7 +85,10 @@ class VLLMWorker(_VllmInnerWorker):
         state_dict = self._rlinf_worker.recv(
             src_group_name=self._actor_group_name, src_rank=self.actor_weight_rank
         )
-        super().wake_up()
+        if self.placement_mode == PlacementMode.COLLOCATED:
+            # in disaggregated mode, rollout backend will never offload weights
+            # so we don't need to wake up when placement is disaggregated
+            super().wake_up()
 
         model = self.model_runner.model
         if colocate:
@@ -100,7 +106,7 @@ class VLLMWorker(_VllmInnerWorker):
     def use_sharded_weights(self) -> None:
         model = self.model_runner.model
         for _, param in model.named_parameters():
-            setattr(param, "is_sharded_weight", True)
+            setattr(param, "is_sharded_weight", self.using_sharded_weight)
 
     def get_dp_rank(self) -> int:
         return self._rlinf_worker.get_parent_rank()

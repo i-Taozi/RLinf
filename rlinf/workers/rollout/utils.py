@@ -381,6 +381,12 @@ class CollocateRankMapper(RankMapper):
         """
         Get the global mapping from actor 1D rank to rollout 2D rank as dict.
         """
+        # rank -> (dp, tp)
+        if actor_tp_size == 1:
+            return {
+                rank: (rank // rollout_tp_size, rank % rollout_tp_size)
+                for rank in range(actor_world_size)
+            }
         rank_map = {}
         for actor_rank in range(actor_world_size):
             rank_map[actor_rank] = cls._get_actor_rank_to_rollout_rank(
@@ -555,12 +561,11 @@ def get_rollout_backend_worker(
     if rollout_backend == "vllm":
         from rlinf.workers.rollout.vllm.vllm_worker import VLLMWorker
 
-        if placement.placement_mode == PlacementMode.COLLOCATED:
+        if (
+            placement.placement_mode == PlacementMode.COLLOCATED
+            or placement.placement_mode == PlacementMode.DISAGGREGATED
+        ):
             return VLLMWorker
-        elif placement.placement_mode == PlacementMode.DISAGGREGATED:
-            raise NotImplementedError(
-                "vLLM rollout backend does not support the pipeline mode."
-            )
         else:
             raise ValueError(f"Unsupported placement mode: {placement.placement_mode}")
     elif rollout_backend == "sglang":

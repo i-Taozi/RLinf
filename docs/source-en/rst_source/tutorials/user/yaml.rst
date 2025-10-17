@@ -744,13 +744,11 @@ algorithm
     auto_reset: True
     ignore_terminations: True
     use_fixed_reset_state_ids: False
-    require_values: True
     normalize_advantages: True
     kl_penalty: kl
 
     n_chunk_steps: 10
     n_eval_chunk_steps: 10
-    rollout_micro_batch_size: 256
     num_group_envs: 32
     rollout_epoch: 1
 
@@ -766,27 +764,21 @@ algorithm
 
 ``algorithm.auto_reset``: Automatically reset environments when episodes terminate.
 
-``algorithm.ignore_terminations``: Ignore episode terminations during training.
+``algorithm.ignore_terminations``: Ignore episode terminations during training (if enabled, episode only ends when it reaches the ``max_episode_steps``).
 
 ``algorithm.use_fixed_reset_state_ids``: Use fixed reset state IDs (false for randomization). Always True for GRPO, default be False for PPO.
 
-``algorithm.require_values``: Whether value function computation is required.
-
 ``algorithm.normalize_advantages``: Normalize advantages across the batch.
 
-``algorithm.kl_penalty``: KL divergence estimation method (kl or kl_penalty).
+``algorithm.n_chunk_steps``: Number of chunks (i.e., times the model is called to predict action chunks) within one rollout epoch.
 
-``algorithm.n_chunk_steps``: Number of action steps per chunk.
-
-``algorithm.n_eval_chunk_steps``: Number of action steps per evaluation chunk.
-
-``algorithm.rollout_micro_batch_size``: Micro-batch size for rollout generation.
+``algorithm.n_eval_chunk_steps``: Number of chunks in evaluation.
 
 ``algorithm.num_group_envs``: Number of environment groups.
 
 ``algorithm.rollout_epoch``: Number of rollout epochs per training step.
 
-``algorithm.reward_type``: Reward aggregation level (chunk_level, token_level, step_level).
+``algorithm.reward_type``: Reward aggregation level (chunk_level, action_level).
 
 ``algorithm.logprob_type``: Log probability computation level.
 
@@ -850,10 +842,6 @@ rollout
 
 ``rollout.backend``: Model backend (huggingface, vllm).
 
-``rollout.enforce_eager``: Disable CUDA graph capture for faster initialization.
-
-``rollout.enable_offload``: Enable model offloading to reduce memory usage.
-
 ``rollout.pipeline_stage_num``: Number of pipeline stages for model parallelism.
 
 actor
@@ -888,13 +876,13 @@ actor
       vocab_size: 32000
       hidden_size: 4096
       policy_setup: "widowx_bridge"
-      vh_mode: "a0"
       image_size: [224, 224]
       is_lora: True
       lora_rank: 32
       lora_path: /storage/models/oft-sft/lora_004000
       ckpt_path: null
       num_images_in_input: 1
+      use_wrist_image: False
       attn_implementation: "flash_attention_2"
       low_cpu_mem_usage: True
       trust_remote_code: True
@@ -960,8 +948,6 @@ actor
 
 ``actor.model.policy_setup``: Policy configuration (widowx_bridge).
 
-``actor.model.vh_mode``: Value head mode (a0).
-
 ``actor.model.image_size``: Input image dimensions [height, width].
 
 ``actor.model.is_lora``: Whether to use LoRA fine-tuning.
@@ -973,6 +959,8 @@ actor
 ``actor.model.ckpt_path``: Path to model checkpoint.
 
 ``actor.model.num_images_in_input``: Number of images in model input.
+
+``actor.model.use_wrist_image``: Whether to use wrist image in model input.
 
 ``actor.model.attn_implementation``: Attention implementation (flash_attention_2).
 
@@ -1075,9 +1063,9 @@ The path is
 
 .. code:: yaml
 
-  num_images_in_input: 1
+  use_wrist_image: False
 
-``num_images_in_input``: Number of images in model input (1 for single camera view).
+``use_wrist_image``: If set to True, wrist images will be added in model inputs.
 
 **Environment Scaling**
 

@@ -26,38 +26,42 @@ UV_TORCH_BACKEND=auto uv sync
 ### Megatron and SGLang/vLLM Dependencies
 Run the following to install Megatron, SGLang or vLLM and their dependencies.
 
-Megatron installation:
 ```shell
-uv sync --extra sgl_vllm
+uv sync --extra sglang-vllm
 mkdir -p /opt && git clone https://github.com/NVIDIA/Megatron-LM.git -b core_r0.13.0 /opt/Megatron-LM
-APEX_CPP_EXT=1 APEX_CUDA_EXT=1 uv pip install -r requirements/megatron.txt --no-build-isolation
+APEX_CPP_EXT=1 APEX_CUDA_EXT=1 NVCC_APPEND_FLAGS="--threads 24" APEX_PARALLEL_BUILD=24 uv pip install -r requirements/megatron.txt --no-build-isolation
 ```
 Before using Megatron, make sure it's path is added to the `PYTHONPATH` environment variables.
 ```shell
 export PYTHONPATH=/opt/Megatron-LM:$PYTHONPATH
 ```
 
-SGLang installation:
-```shell
-uv sync --extra sglang
-```
-
-vLLM installation:
-```shell
-uv sync --extra vllm
-```
-
 ### Embodied Dependencies
 For embodied experiments, first install the necessary system dependencies (currently only Debian/Ubuntu `apt` package management is supported).
 ```shell
-bash requirements/install_embodied_deps.sh
 uv sync --extra embodied
+bash requirements/install_embodied_deps.sh # Must be run after the above command
 ```
-Next, depending on the experiment types, install the `openvla` or `pi0` dependencies.
+Next, depending on the experiment types, install the `openvla`, `openvla_oft` or `pi0` dependencies.
 ```shell
-# For OpenVLA/OpenVLA-oft experiments
+# For OpenVLA experiments
 UV_TORCH_BACKEND=auto uv pip install -r requirements/openvla.txt --no-build-isolation
 
-# For Pi0 experiment
-UV_TORCH_BACKEND=auto uv pip install -r requirements/pi0.txt --no-build-isolation
+# For OpenVLA-oft experiment
+UV_TORCH_BACKEND=auto uv pip install -r requirements/openvla_oft.txt --no-build-isolation
+
+# For openpi experiment
+UV_TORCH_BACKEND=auto GIT_LFS_SKIP_SMUDGE=1 uv pip install -r requirements/openpi.txt
+cp -r .venv/lib/python3.11/site-packages/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/
+TOKENIZER_DIR=/root/.cache/openpi/big_vision/ && mkdir -p $TOKENIZER_DIR && gsutil -m cp -r gs://big_vision/paligemma_tokenizer.model $TOKENIZER_DIR
+```
+
+Finally, Run the following to install the LIBERO dependency.
+
+```shell
+mkdir -p /opt && git clone https://github.com/RLinf/LIBERO.git /opt/libero
+```
+Before using LIBERO, make sure its path is added to the `PYTHONPATH` environment variables.
+```shell
+export PYTHONPATH=/opt/libero:$PYTHONPATH
 ```

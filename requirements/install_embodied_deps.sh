@@ -3,6 +3,8 @@
 # Embodied dependencies
 apt-get update -y
 apt-get install -y --no-install-recommends \
+    wget \
+    unzip \
     libibverbs-dev \
     mesa-utils \
     libosmesa6-dev \
@@ -18,6 +20,13 @@ apt-get install -y --no-install-recommends \
     libsm6 \
     libxext6 \
     libxrender-dev \
-    libgomp1 \
+    libgomp1
+
+python -m mani_skill.utils.download_asset bridge_v2_real2sim -y
+python -m mani_skill.utils.download_asset widowx250s -y
+
+PHYSX_VERSION=105.1-physx-5.3.1.patch0
+PHYSX_DIR=~/.sapien/physx/$PHYSX_VERSION
+mkdir -p $PHYSX_DIR && wget -O $PHYSX_DIR/linux-so.zip https://github.com/sapien-sim/physx-precompiled/releases/download/$PHYSX_VERSION/linux-so.zip && unzip $PHYSX_DIR/linux-so.zip -d $PHYSX_DIR && rm $PHYSX_DIR/linux-so.zip
 
 

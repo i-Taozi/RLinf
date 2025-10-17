@@ -689,13 +689,11 @@ algorithm
     auto_reset: True
     ignore_terminations: True
     use_fixed_reset_state_ids: False
-    require_values: True
     normalize_advantages: True
     kl_penalty: kl
 
     n_chunk_steps: 10
     n_eval_chunk_steps: 10
-    rollout_micro_batch_size: 256
     num_group_envs: 32
     rollout_epoch: 1
 
@@ -710,27 +708,21 @@ algorithm
 
 ``algorithm.auto_reset``：是否在 episode 结束时自动重置环境。
 
-``algorithm.ignore_terminations``：训练时是否忽略 episode 的终止信号。
+``algorithm.ignore_terminations``：训练时是否忽略 episode 的终止信号（若开启，episode 仅在达到最大步数时结束）。
 
 ``algorithm.use_fixed_reset_state_ids``：是否使用固定 reset 状态 ID（GRPO 推荐 True，PPO 默认为 False，旨在随机化）。
 
-``algorithm.require_values``：是否需要同时计算值函数。
-
 ``algorithm.normalize_advantages``：是否对优势值归一化处理。
 
-``algorithm.kl_penalty``：KL 散度的估算方式（kl 或 kl_penalty）。
+``algorithm.n_chunk_steps``：每个 rollout epoch 中的 chunk 数量（调用模型 predict 的次数）。
 
-``algorithm.n_chunk_steps``：每个 chunk 的动作步数。
-
-``algorithm.n_eval_chunk_steps``：评估模式下每个 chunk 的动作步数。
-
-``algorithm.rollout_micro_batch_size``：Rollout 生成时的微批大小。
+``algorithm.n_eval_chunk_steps``：评估模式下的 chunk 数量。
 
 ``algorithm.num_group_envs``：环境组数量（用于并行）。
 
 ``algorithm.rollout_epoch``：每个训练步骤前的 rollout 轮数。
 
-``algorithm.reward_type``：奖励聚合层级（chunk_level、token_level、step_level）。
+``algorithm.reward_type``：奖励聚合层级（chunk_level、action_level）。
 
 ``algorithm.logprob_type``：对数概率的计算层级。
 
@@ -793,10 +785,6 @@ rollout
 
 ``rollout.backend``：模型后端（huggingface、vllm）。  
 
-``rollout.enforce_eager``：禁用 CUDA graph，以更快完成初始化。  
-
-``rollout.enable_offload``：启用模型下放以降低内存占用。  
-
 ``rollout.pipeline_stage_num``：模型并行的流水线阶段数。
 
 actor
@@ -831,13 +819,13 @@ actor
       vocab_size: 32000
       hidden_size: 4096
       policy_setup: "widowx_bridge"
-      vh_mode: "a0"
       image_size: [224, 224]
       is_lora: True
       lora_rank: 32
       lora_path: /storage/models/oft-sft/lora_004000
       ckpt_path: null
       num_images_in_input: 1
+      use_wrist_image: False
       attn_implementation: "flash_attention_2"
       low_cpu_mem_usage: True
       trust_remote_code: True
@@ -898,8 +886,6 @@ actor
 
 ``actor.model.policy_setup``：策略配置（widowx_bridge）。  
 
-``actor.model.vh_mode``：价值头模式（a0）。
-
 ``actor.model.image_size``：输入图像尺寸 [H, W]。  
 
 ``actor.model.is_lora / lora_rank / lora_path``：是否使用 LoRA、秩与权重路径。  
@@ -907,6 +893,8 @@ actor
 ``actor.model.ckpt_path``：模型 checkpoint 路径。  
 
 ``actor.model.num_images_in_input``：输入的图像数量。  
+
+``actor.model.use_wrist_image``：是否使用机器人末端手腕（wrist）上的摄像头拍摄的图像。  
 
 ``actor.model.attn_implementation``：注意力实现（flash_attention_2）。  
 
@@ -1005,9 +993,9 @@ actor
 
 .. code:: yaml
 
-  num_images_in_input: 1
+  use_wrist_image: False
 
-``num_images_in_input``：模型输入的图像数量（单相机视角为 1）。
+``use_wrist_image``：是否使用机器人末端手腕（wrist）上的摄像头拍摄的图像。
 
 **环境规模**
 
