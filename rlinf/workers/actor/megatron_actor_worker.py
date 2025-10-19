@@ -1128,7 +1128,6 @@ class MegatronActor(MegatronModelManager, Worker):
         Args:
             input_channel: The input channel to read from.
             output_channel: The output channel to send results to.
-            rollout_channel: get the rollout channel's device lock in case of collision.
             compute_ref_logprobs: Whether to compute reference logprobs.
         """
         recv_batch_size = 0
@@ -1212,9 +1211,11 @@ class MegatronActor(MegatronModelManager, Worker):
             del self.reshard_state_dict
             clear_memory()
 
-    def sync_model_to_rollout_transfer(self):
+    def sync_model_to_rollout(self):
+        """Send the model weights to the destination ranks in the rollout task."""
         if not self.is_running:
             return
+        self.get_model_state_and_offload()
         if self.component_placement._placement_mode == PlacementMode.COLLOCATED:
             handle = {k: reduce_tensor(v) for k, v in self.reshard_state_dict.items()}
             self.send(handle, self.rollout_group_name, self._weight_dst_rank_in_rollout)
@@ -1225,7 +1226,6 @@ class MegatronActor(MegatronModelManager, Worker):
                     self.rollout_group_name,
                     weight_dst_rank,
                 )
-        self.del_reshard_state_dict()
 
     def get_model_state_and_offload(self):
         """Send the model weights to the destination ranks in the rollout task.

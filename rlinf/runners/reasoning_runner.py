@@ -303,13 +303,13 @@ class ReasoningRunner:
             self.dataloader_channel.put(request, async_op=True)
 
     def _sync_weights(self):
+        self.actor.sync_model_to_rollout()
+        self.rollout.sync_model_from_actor().wait()
+        self.actor.del_reshard_state_dict().wait()
+
         if self.has_dedicated_inference:
             self.actor.sync_model_to_inference()
             self.inference.sync_model_from_actor().wait()
-
-        self.actor.get_model_state_and_offload().wait()
-        self.actor.sync_model_to_rollout_transfer()
-        self.rollout.sync_model_from_actor().wait()
 
     def run(self):
         epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)

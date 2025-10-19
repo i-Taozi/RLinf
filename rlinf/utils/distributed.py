@@ -31,7 +31,11 @@ from rlinf.utils.timers import NamedTimer
 
 
 def compute_rollout_metrics(
-    rollout_batch, max_prompt_len, response_len, data_parallel_group, use_critic=False
+    rollout_batch: Dict[str, torch.Tensor],
+    max_prompt_len: int,
+    response_len: int,
+    data_parallel_group: Optional[ProcessGroup] = None,
+    use_critic: bool = False,
 ):
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     advantages = rollout_batch["advantages"].to(device=device)

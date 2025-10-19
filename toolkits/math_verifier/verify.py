@@ -418,9 +418,9 @@ def math_verify_call(
         finally:
             is_correct_list.append(is_correct)
 
-        if has_timeout:
-            reset_global_process_pool()
-        return is_correct_list
+    if has_timeout:
+        reset_global_process_pool()
+    return is_correct_list
 
 
 if __name__ == "__main__":

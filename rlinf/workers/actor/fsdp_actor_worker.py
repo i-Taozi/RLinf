@@ -478,7 +478,7 @@ class FSDPActor(FSDPModelManager, Worker):
 
         # Rollout metrics
         rollout_metrics, _, _ = compute_math_rollout_metrics(
-            batch, self.cfg.data.max_prompt_length, self.response_len, self._world_size
+            batch, self.cfg.data.max_prompt_length, self.response_len
         )
 
         return rollout_metrics, training_metrics_list
