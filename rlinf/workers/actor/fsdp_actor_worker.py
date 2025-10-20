@@ -299,6 +299,9 @@ class FSDPActor(FSDPModelManager, Worker):
             f"Expected {self.total_batch_size_per_dp} sequences from channel, but got {recv_batch_size}"
         )
         batch = RolloutResult.merge_batches(batches)
+
+        # Compute advantages and returns
+        batch = self.compute_advantages_and_returns(batch)
         # Must be called after batch is retrieved, which is when rollout has stopped
         # Otherwise, loading model might cause OOM
         self._load_weight_and_optimizer()
@@ -494,36 +497,24 @@ class FSDPActor(FSDPModelManager, Worker):
         torch.distributed.barrier()
 
     # Advantages and returns
-    def compute_advantages_and_returns(
-        self, input_channel: Channel, output_channel: Channel
-    ) -> None:
+    def compute_advantages_and_returns(self, batch: Dict[str, torch.Tensor]):
         """Compute the advantages and returns.
 
         Args:
-            input_channel: The input channel to read from.
-            output_channel: The output channel to send results to.
+            batch (Dict[str, torch.Tensor]): The rollout batch.
         """
-        recv_batch_size = 0
-        while recv_batch_size < self.total_batch_size_per_dp:
-            batch, rollout_result = self.get_batch(input_channel)
-            recv_batch_size += rollout_result.num_sequence
 
-            with self.worker_timer():
-                if rollout_result.advantages is None:
-                    mask = batch["attention_mask"][:, -self.response_len :]
-                    advantages, returns = calculate_adv_and_returns(
-                        adv_type=self.cfg.algorithm.adv_type,
-                        reward_scores=batch["rewards"].cuda(),
-                        mask=mask.cuda(),
-                        num_responses=self.cfg.algorithm.group_size,
-                    )
-                    rollout_result.advantages = advantages.cpu()
+        with self.worker_timer():
+            mask = batch["attention_mask"][:, -self.response_len :]
+            advantages, returns = calculate_adv_and_returns(
+                adv_type=self.cfg.algorithm.adv_type,
+                reward_scores=batch["rewards"].cuda(),
+                mask=mask.cuda(),
+                num_responses=self.cfg.algorithm.group_size,
+            )
+            batch["advantages"] = advantages
 
-            self.put_result(rollout_result, output_channel)
-
-        assert recv_batch_size == self.total_batch_size_per_dp, (
-            f"Expected {self.total_batch_size_per_dp} sequences from channel, but got {recv_batch_size}"
-        )
+        return batch
 
 
 class EmbodiedFSDPActor(FSDPModelManager, Worker):
