@@ -594,7 +594,7 @@ class RolloutManager(ComponentManager):
         # find minimum instance num to main_loop_finish rollout before last train iter
         min_instance_num_needed = math.ceil(
             self.running_tasks
-            / (self.pre_iter_speed_per_instance * remain_iter_before_last)
+            / (self.pre_iter_speed_per_instance * remain_iter_before_last + 0.001)
         )
 
         released_instance_num_max = max(
@@ -700,6 +700,7 @@ class InferenceManager(ComponentManager):
 
     async def main_loop_finalize(self):
         """Processing after the last training iteration in main_loop."""
+        await self.main_loop_finished_handler.async_wait()
         assert self.main_loop_finished_handler.done()
 
     async def release_resource(

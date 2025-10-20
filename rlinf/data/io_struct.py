@@ -1044,6 +1044,15 @@ class BatchResizingIterator:
         self.prefetch_micro_batch = None  # Used for computing batch info
         self.global_batch_done = False
         self.batches = []
+        self.get_batch_fn_handler = None
+
+    def register_get_batch_handler(self, handler: Callable):
+        """This enables processing a batch after calling self.get_batch_fn.
+
+        Args:
+            handler (Callable): The handler function to process the return value of self.get_batch_fn.
+        """
+        self.get_batch_fn_handler = handler
 
     def reset_total_batch_size(self, total_batch_size: int):
         self.total_batch_size = total_batch_size
@@ -1097,6 +1106,8 @@ class BatchResizingIterator:
     def _get_global_batches(self):
         """Split a batch into multiple global batches, each of which will be used for one step of inference/training."""
         batch, result = self.get_batch_fn()
+        if self.get_batch_fn_handler is not None:
+            batch = self.get_batch_fn_handler(batch)
         batch_size = result.num_sequence
         if batch_size % self.global_batch_size != 0:
             # If the batch size is smaller than the global batch size per data parallel group,

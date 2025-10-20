@@ -86,7 +86,6 @@ class ReasoningRunner:
         # if inference is not a dedicated worker
         self.inference_channel = Channel.create("Inference")
         self.reward_channel = Channel.create("Reward")
-        self.actor_channel = Channel.create("Actor", local=True)
 
         # Configurations
         self.compute_ref_logprobs = self.cfg.algorithm.kl_beta > 0
@@ -303,13 +302,13 @@ class ReasoningRunner:
             self.dataloader_channel.put(request, async_op=True)
 
     def _sync_weights(self):
-        self.actor.sync_model_to_rollout()
-        self.rollout.sync_model_from_actor().wait()
-        self.actor.del_reshard_state_dict().wait()
-
         if self.has_dedicated_inference:
             self.actor.sync_model_to_inference()
             self.inference.sync_model_from_actor().wait()
+
+        self.actor.sync_model_to_rollout()
+        self.rollout.sync_model_from_actor().wait()
+        self.actor.del_reshard_state_dict().wait()
 
     def run(self):
         epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)
@@ -361,15 +360,9 @@ class ReasoningRunner:
                         infer_handle = None
                         inference_channel = self.reward_channel
 
-                    # Advantages and returns
-                    adv_handle: Handle = self.actor.compute_advantages_and_returns(
-                        input_channel=inference_channel,
-                        output_channel=self.actor_channel,
-                    )
-
                     # Actor training
                     actor_handle: Handle = self.actor.run_training(
-                        input_channel=self.actor_channel,
+                        input_channel=inference_channel,
                     )
 
                     metrics = actor_handle.wait()
@@ -409,7 +402,6 @@ class ReasoningRunner:
                 time_metrics["training"] = actor_handle.consume_duration()
                 time_metrics["rollout"] = rollout_handle.consume_duration()
                 time_metrics["reward"] = reward_handle.consume_duration()
-                time_metrics["advantage"] = adv_handle.consume_duration()
                 if infer_handle is not None:
                     # Inference time should be the min time across ranks, because different DP receive the rollout results differently
                     # But at the begin of the pp schedule, there is a timer barrier

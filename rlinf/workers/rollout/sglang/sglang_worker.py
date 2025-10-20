@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import copy
 import dataclasses
 from typing import Any, Dict, List
 
@@ -330,6 +331,18 @@ class SGLangWorker(Worker):
             image_data_list: List = []
             for idx in seq_idx_list:
                 generated_ids: List[int] = seq_group_info.results[idx]["output_ids"]
+                if len(generated_ids) >= self._sampling_params["max_new_tokens"]:
+                    # avoid genererating for sequences that have already meet their max_new_tokens
+                    self.log_warning(
+                        f"SeqGroup {seq_group_info.id} idx {seq_group_info.results[idx]} "
+                        f"has generated {len(generated_ids)} tokens, "
+                        f"exceeding max_new_tokens={self._sampling_params['max_new_tokens']}, "
+                        f"it will be truncatured."
+                    )
+                    result = copy.deepcopy(seq_group_info.results[idx])
+                    result["meta_info"]["finish_reason"]["type"] = "length"
+                    seq_group_info.record_sglang_result(idx, result)
+                    continue
                 input_batch.append(seq_group_info.input_ids + generated_ids)
                 params = self._sampling_params.copy()
                 params["max_new_tokens"] -= len(generated_ids)
