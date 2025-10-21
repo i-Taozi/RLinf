@@ -65,21 +65,6 @@ def get_scheduler_response_queue(instance_id: int = 0):
     return f"schedule_response_{instance_id}"
 
 
-# Rollout Communication Related
-@dataclass
-class RolloutMigrateBatch:
-    """Rollout migrate batch."""
-
-    input_ids: list = None
-    results: list = None
-    abort_results: list = None
-    answers: list = None
-
-    def get_running_tasks(self) -> int:
-        """Get the number of running tasks."""
-        return len(self.abort_results)
-
-
 @dataclass
 class RolloutReport:
     """Rollout report."""

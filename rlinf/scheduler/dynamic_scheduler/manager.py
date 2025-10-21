@@ -253,11 +253,11 @@ class RolloutManager(ComponentManager):
 
         while True:
             report_str = await self.report()
-            await asyncio.sleep(1)
             if self.running_tasks <= running_tasks_threshold:
                 self._logger.info("\npre_process condition satisfied:\n" + report_str)
                 await self.migrate(migrate_out_instance_num)
                 break
+            await asyncio.sleep(1)
 
     async def main_loop_finalize(self):
         """Processing after the last training iteration in main_loop. Perform RolloutAction.Finish on all surviving instances."""
