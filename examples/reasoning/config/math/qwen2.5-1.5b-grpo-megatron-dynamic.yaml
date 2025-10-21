@@ -15,6 +15,7 @@ cluster:
     actor: 0-1
     rollout: 2-5
     inference: 6-7
+    reward: all
 
 runner:
   task_type: math

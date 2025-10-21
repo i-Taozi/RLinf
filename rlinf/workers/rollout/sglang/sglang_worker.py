@@ -51,17 +51,8 @@ class SGLangWorker(Worker):
         self._placement = placement
 
         self._tokenizer = AutoTokenizer.from_pretrained(self._cfg.rollout.model_dir)
-        self._eos = self._cfg.rollout.eos or self._tokenizer.eos_token_id
         self._return_logprobs = self._cfg.rollout.return_logprobs
         self._sampling_params = SGLangWorker.get_sampling_param_from_config(self._cfg)
-        if self._cfg.algorithm.rollout_batch_size_per_gpu is None:
-            self._rollout_batch_size = None
-        else:
-            self._rollout_batch_size = (
-                self._cfg.algorithm.rollout_batch_size_per_gpu
-                * self._cfg.rollout.tensor_parallel_size
-                * self._cfg.rollout.pipeline_parallel_size
-            )
 
         self._validate_sampling_params = {"temperature": 0, "max_new_tokens": 32}
         self._validate_prompts = [
@@ -146,7 +137,6 @@ class SGLangWorker(Worker):
                 self._cfg.rollout.max_running_requests,
             ),
             load_format="dummy" if not self._cfg.rollout.validate_weight else "auto",
-            # disable_overlap_schedule=True,
             dtype=torch_dtype_from_precision(self._cfg.actor.model.precision),
             # sglang will only return text/output_ids when skip_tokenizer_init=False/True
             # text is not needed in RL training, so set to True can save time.
@@ -163,29 +153,6 @@ class SGLangWorker(Worker):
         self._engine = Engine(
             **dataclasses.asdict(server_args),
         )
-
-    def _pre_process_rollout_request(
-        self, request: RolloutRequest
-    ) -> List[List[RolloutRequest]]:
-        group_size = request.n
-        repeated_request = request.repeat()
-        if self._rollout_batch_size is not None:
-            assert len(repeated_request.input_ids) % self._rollout_batch_size == 0, (
-                f"rollout_batch_size {self._rollout_batch_size} must divide the total number of requests {len(repeated_request)}"
-            )
-            num_batch = len(repeated_request.input_ids) // self._rollout_batch_size
-        else:
-            num_batch = 1
-
-        # Split the repeated request into smaller requests based on the rollout batch size
-        # avoid too large request that may cause KV cache OOM
-        split_requests = repeated_request.split(num_batch)
-        if self._placement.is_disaggregated:
-            num_prompts_per_request = len(split_requests[0].input_ids) // group_size
-            # for disaggregated mode, split to ensure each small request has full group_size prompts
-            return [r.split(num_prompts_per_request) for r in split_requests]
-        else:
-            return [r.split(1) for r in split_requests]
 
     def shutdown(self):
         """
@@ -219,13 +186,6 @@ class SGLangWorker(Worker):
             )
             print("===============================", flush=True)
 
-    async def _stop(self):
-        self.log_debug(
-            f"[LLM dp {self._rank}] Received None input tokens, rollout end."
-        )
-        if not self._placement.is_disaggregated:
-            await self.offload_engine()
-
     async def async_generate(
         self,
         prompt: List[str] | str | None = None,
@@ -252,7 +212,7 @@ class SGLangWorker(Worker):
             request_info (Any | None): Any additional request info you wish to be associated with this generation request. This argument will not be passed to the SGLang engine and returned directly.
 
         Returns:
-            Tuple[Dict, Any, List[List[int]]]: A tuple containing the engine result and the original request_info.
+            Tuple[Dict, Any | None]: A tuple containing the engine result and the original request_info.
         """
         result = await self._engine.async_generate(
             prompt=prompt,
@@ -378,8 +338,7 @@ class SGLangWorker(Worker):
         return seq_group_info
 
     async def rollout(self, input_channel: Channel, output_channel: Channel):
-        if self._rank == 0:
-            self.log_info("Starting async generation...")
+        self.log_on_first_rank("Start generation...")
         request: RolloutRequest = input_channel.get()
         groups = request.to_seq_group_infos()
         async_wait_type = (
@@ -406,15 +365,9 @@ class SGLangWorker(Worker):
                 ]
                 for group in returned_seq_groups:
                     if group.all_completed:
-                        rollout_result = RolloutResult.from_sglang_results(
-                            group.results,
-                            group.group_size,
-                            [group.input_ids] * group.group_size,
-                            [group.answer] * group.group_size,
-                            image_data=[group.image_data] * group.group_size,
-                            multi_modal_inputs=[group.multi_modal_inputs]
-                            * group.group_size,
-                            return_logprobs=self._return_logprobs,
+                        rollout_result = RolloutResult.from_sglang_seq_group(
+                            group,
+                            self._return_logprobs,
                         )
                         all_rollout_results.append(rollout_result)
                         await output_channel.put(
