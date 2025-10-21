@@ -22,7 +22,8 @@ from rlinf.scheduler.dynamic_scheduler.manager import (
     create_component_manager,
 )
 from rlinf.scheduler.dynamic_scheduler.utils import (
-    get_valid_dp_sizes,
+    get_global_scheduer_state,
+    set_global_scheduer_state,
 )
 from rlinf.utils.placement import ComponentPlacement
 
@@ -34,15 +35,14 @@ class SchedulerWorker(Worker):
         self,
         config: DictConfig,
         component_placement: ComponentPlacement,
-        component_order: List[str] = ["rollout", "inference", "actor"],
+        workflow: List[str] = ["rollout", "inference", "actor"],
     ):
         """Initialize the SchedulerWorker."""
         super().__init__()
         self.cfg = config
         self.component_placement = component_placement
         self.components = self.component_placement._components
-        self.total_gpus = self.component_placement._cluster_num_gpus
-        self.component_order = component_order
+        self.workflow = workflow
 
         assert self.cfg.rollout.rollout_backend == "sglang", (
             "only sglang is supported for dynamic scheduler"
@@ -53,7 +53,7 @@ class SchedulerWorker(Worker):
         assert "rollout" in self.components, "rollout component is required"
         assert "actor" in self.components, "actor component is required"
 
-        # Set policies for scheduler
+        # Set policies for dynamic-scheduler
         self.use_pre_process_policy = getattr(
             self.cfg.cluster, "use_pre_process_policy", True
         )
@@ -71,31 +71,19 @@ class SchedulerWorker(Worker):
             "channel_factory": self.create_channel,
         }
         self.component_managers: Dict[str, ComponentManager] = {}
-
-        self.rollout_manager: ComponentManager = create_component_manager(
-            "rollout", component_manager_kwargs
-        )
-        self.component_managers["rollout"] = self.rollout_manager
-
-        self.actor_manager: ComponentManager = create_component_manager(
-            "actor", component_manager_kwargs
-        )
-        self.component_managers["actor"] = self.actor_manager
-
-        if "inference" in self.components:
-            self.inference_manager: ComponentManager = create_component_manager(
-                "inference", component_manager_kwargs
+        for component in self.components:
+            if component == "reward":
+                continue
+            self.component_managers[component] = create_component_manager(
+                component, component_manager_kwargs
             )
-            self.component_managers["inference"] = self.inference_manager
 
-        # Set actor_valid_dp_sizes for rollout/actor manager.
-        actor_valid_dp_sizes = get_valid_dp_sizes(
+        set_global_scheduer_state(
             self.cfg,
             self.component_placement._cluster_num_gpus,
-            self.actor_manager.model_parallel_size,
+            self.component_managers,
         )
-        self.actor_manager.actor_valid_dp_sizes = actor_valid_dp_sizes
-        self.rollout_manager.actor_valid_dp_sizes = actor_valid_dp_sizes
+        self.scheduler_state = get_global_scheduer_state()
 
     async def run(self):
         """Run the scheduler."""
@@ -103,51 +91,40 @@ class SchedulerWorker(Worker):
         await self.main_loop()
 
     async def pre_process(self):
-        """Pre process.
-
-        Reset component manager states and execute use_pre_process_policy.
-        Need to ensure rollout completes first.
-        """
-        await self.rollout_manager.pre_process()
+        """Reset component manager states and execute pre_process policy."""
+        await self.component_managers["rollout"].pre_process()
 
         for component, manager in self.component_managers.items():
             if component != "rollout":
                 await manager.pre_process()
 
-    async def main_loop(self):
-        """Main loop.
+        self.scheduler_state.reset()
 
-        The signal synchronization granularity is consistent with the actor training granularity.
-        Trying to release or allocate gpu resource for each components by component_order.
-        """
-        available_gpu_num = 0
+    async def main_loop(self):
+        """Main loop. Trying to release or allocate gpu resource for each components by workflow after actor ready to update."""
         for train_iter in range(self.cfg.algorithm.n_minibatches):
             # Wait for actor ready to update
-            await self.actor_manager.wait_for_actor_update()
+            await self.component_managers["actor"].wait_for_actor_update()
 
-            # Trying to release or allocate resource for each components by component_order
+            # Trying to release or allocate resource for each components by workflow
             resource_info = f"[Release && Allocate Info] After train-iter{train_iter}\n"
-            for component in self.component_order:
+            for component in self.workflow:
                 if component not in self.component_managers:
                     self.log_warning(f"can't find ComponentManager for {component}")
                     continue
 
-                release_or_allocate_params = {
-                    "train_iter": train_iter,
-                    "actor_current_instance_num": self.actor_manager.current_instance_num,
-                    "rollout_current_instance_num": self.rollout_manager.current_instance_num,
-                    "available_gpu_num": available_gpu_num,
-                }
                 released_gpu_num, incremental_gpu_num = await self.component_managers[
                     component
-                ].release_or_allocate(**release_or_allocate_params)
-                assert released_gpu_num == 0 or incremental_gpu_num == 0
+                ].release_or_allocate(train_iter)
 
-                available_gpu_num += released_gpu_num - incremental_gpu_num
+                self.scheduler_state.update(
+                    component, released_gpu_num, incremental_gpu_num
+                )
+
                 resource_info += (
                     f"{component} : released_gpu_num = {released_gpu_num}, "
                     f"incremental_gpu_num={incremental_gpu_num} => "
-                    f"available_gpu_num={available_gpu_num}\n"
+                    f"available_gpu_num={self.scheduler_state.available_gpu_num}\n"
                 )
 
             self.log_info(resource_info)

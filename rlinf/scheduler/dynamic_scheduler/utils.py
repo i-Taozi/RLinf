@@ -14,10 +14,13 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Dict, List
+
+from omegaconf import DictConfig
 
 if TYPE_CHECKING:
     from rlinf.data.io_struct import SeqGroupInfo
+    from rlinf.scheduler.dynamic_scheduler.manager import ComponentManager
 
 
 def get_valid_dp_sizes(cfg, total_gpus, model_parallel_size_with_cp) -> List[int]:
@@ -109,3 +112,66 @@ class RolloutScheduleInfo:
     data: List["SeqGroupInfo"] = None
     report: RolloutReport = None
     action: RolloutAction = RolloutAction.Default
+
+
+class _DynamicSchedulerState:
+    """GPU resource state and components' state."""
+
+    def __init__(
+        self,
+        cfg: DictConfig,
+        total_gpus: int,
+        component_managers: Dict[str, "ComponentManager"],
+    ):
+        """Initialize the dynamic scheduler state."""
+        self.total_gpus = total_gpus
+        self.available_gpu_num = 0
+        self.component_managers = component_managers
+
+        self.components_instance_num: Dict[str, int] = {}
+        self.components_model_parallel_size: Dict[str, int] = {}
+        for component, manager in self.component_managers.items():
+            self.components_instance_num[component] = manager.current_instance_num
+            self.components_model_parallel_size[component] = manager.model_parallel_size
+
+        self.actor_valid_dp_sizes: List[int] = get_valid_dp_sizes(
+            cfg, total_gpus, self.components_model_parallel_size["actor"]
+        )
+
+    def reset(self):
+        """Reset state."""
+        self.available_gpu_num = 0
+        for component, manager in self.component_managers.items():
+            self.components_instance_num[component] = manager.current_instance_num
+
+    def update(self, component: str, released_gpu_num: int, incremental_gpu_num: int):
+        """Update current state."""
+        assert released_gpu_num == 0 or incremental_gpu_num == 0
+        self.available_gpu_num += released_gpu_num - incremental_gpu_num
+        self.components_instance_num[component] = self.component_managers[
+            component
+        ].current_instance_num
+
+    def get_component_instance_num(self, component: str):
+        return self.components_instance_num[component]
+
+    def get_component_model_parallel_size(self, component: str):
+        return self.components_model_parallel_size[component]
+
+
+DynamicSchedulerState = None
+
+
+def set_global_scheduer_state(
+    cfg: DictConfig, total_gpus: int, component_managers: Dict[str, "ComponentManager"]
+):
+    """Set DynamicSchedulerState."""
+    global DynamicSchedulerState
+    DynamicSchedulerState = _DynamicSchedulerState(cfg, total_gpus, component_managers)
+
+
+def get_global_scheduer_state() -> _DynamicSchedulerState:
+    """Get DynamicSchedulerState."""
+    global DynamicSchedulerState
+    assert DynamicSchedulerState is not None
+    return DynamicSchedulerState
