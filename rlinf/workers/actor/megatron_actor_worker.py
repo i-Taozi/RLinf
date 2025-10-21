@@ -87,7 +87,7 @@ from rlinf.utils.utils import (
 from rlinf.workers.rollout.utils import RankMapper
 
 try:
-    from params_resharding import resharding_init
+    from params_resharding import nccl_group_recreate, resharding_init
 
     HAVE_RESHARDING = True
 except ImportError:
@@ -212,11 +212,17 @@ class MegatronActor(MegatronModelManager, Worker):
             getattr(self.cfg.cluster, "use_pre_process_policy", False)
             and self.use_auto_scheduler
         )
+        self.recreate_nccl_groups = (
+            getattr(self.cfg.cluster, "recreate_nccl_groups", False)
+            and self.use_pre_process_policy
+        )
 
-        if self.use_auto_scheduler:
-            self.schedule_channel = self.connect_channel(get_scheduler_channel(role))
-            self.scheduler_request_queue = get_scheduler_request_queue(self._rank)
-            self.scheduler_response_queue = get_scheduler_response_queue(self._rank)
+        if self.use_auto_scheduler and self._rank == 0:
+            self.schedule_channel = self.connect_channel(
+                get_scheduler_channel(role, self._rank)
+            )
+            self.scheduler_request_queue = get_scheduler_request_queue()
+            self.scheduler_response_queue = get_scheduler_response_queue()
 
     def _init_profiler(self):
         def _validate_schedule_info():
@@ -1209,6 +1215,8 @@ class MegatronActor(MegatronModelManager, Worker):
 
     def sync_model_to_rollout(self):
         """Send the model weights to the destination ranks in the rollout task."""
+        if self.recreate_nccl_groups:
+            nccl_group_recreate()
         if not self.is_running:
             return
         self.get_model_state_and_offload()

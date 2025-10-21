@@ -50,19 +50,19 @@ def get_valid_dp_sizes(cfg, total_gpus, model_parallel_size_with_cp) -> List[int
     return valid_dp_sizes
 
 
-def get_scheduler_channel(component: str):
+def get_scheduler_channel(component: str, instance_id: int = 0):
     """Get the scheduler channel name."""
-    return f"schedule_channel_{component}"
+    return f"dynamic_scheduler_channel_for_{component}_{instance_id}"
 
 
-def get_scheduler_request_queue(instance_id: int = 0):
+def get_scheduler_request_queue():
     """Get the scheduler request queue name."""
-    return f"schedule_request_{instance_id}"
+    return "dynamic_scheduler_request_queue"
 
 
-def get_scheduler_response_queue(instance_id: int = 0):
+def get_scheduler_response_queue():
     """Get the scheduler response queue name."""
-    return f"schedule_response_{instance_id}"
+    return "dynamic_scheduler_response_queue"
 
 
 @dataclass

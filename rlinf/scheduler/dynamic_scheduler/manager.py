@@ -17,7 +17,7 @@ import math
 import time
 from abc import ABC, abstractmethod
 from logging import Logger
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Tuple
 
 from omegaconf import DictConfig
 
@@ -91,16 +91,22 @@ class ComponentManager(ABC):
 
         self.reset()
 
-    def create_channel(self, communication_instance_num: int):
-        """Create channel queues for communication.
+    def create_channels(self, channel_num: int):
+        """Create channels and queues for communication, and each channel is for a single instance.
 
         Args:
-            communication_instance_num (int): The number of communication instances.
+            channel_num (int): The number of channel.
         """
-        self.channel = self.channel_factory(get_scheduler_channel(self.component_role))
-        for instance_id in range(communication_instance_num):
-            self.channel.create_queue(get_scheduler_request_queue(instance_id))
-            self.channel.create_queue(get_scheduler_response_queue(instance_id))
+        self.channels = []
+        self.request_queue = get_scheduler_request_queue()
+        self.response_queue = get_scheduler_response_queue()
+        for instance_id in range(channel_num):
+            channel = self.channel_factory(
+                get_scheduler_channel(self.component_role, instance_id)
+            )
+            channel.create_queue(self.request_queue)
+            channel.create_queue(self.response_queue)
+            self.channels.append(channel)
 
     def reset(self):
         """Reset state of ComponentManager."""
@@ -191,7 +197,6 @@ class RolloutManager(ComponentManager):
 
     - report  : collect the report from all alive rollout instances
     - finish  : send Finish or Wait_For_Finish signal to all alive rollout instances
-        - check_offloaded : check if the rollout instances with id in in finished_instance_ids have been finished
     - migrate : migrate the rollout instances
         - migrate_policy : return the max number of rollout instances could migrate out
         - find_release_instance_num_needed : find the number of rollout instances needed to release
@@ -217,7 +222,7 @@ class RolloutManager(ComponentManager):
             channel_factory=channel_factory,
             _logger=_logger,
         )
-        self.create_channel(self.init_instance_num)
+        self.create_channels(self.init_instance_num)
 
         self.max_running_requests = self.cfg.rollout.max_running_requests
         self.rollout_total_tasks = (
@@ -311,150 +316,150 @@ class RolloutManager(ComponentManager):
 
     # ------------------------------------------------- override end -------------------------------------------------
 
-    async def send_request(
+    async def _scatter_requests(
         self,
-        request: RolloutScheduleInfo,
-        rollout_instance_id: int,
-        need_feedback: bool = True,
-    ) -> Optional[RolloutScheduleInfo]:
-        """Send the request to the rollout instance.
+        requests: RolloutScheduleInfo | List[RolloutScheduleInfo],
+        instance_ids: List[int],
+    ):
+        """Scatter the requests to the rollout instances.
 
         Args:
-            request (RolloutScheduleInfo): The request to send.
-            rollout_instance_id (int): The id of the rollout instance.
-            need_feedback (bool): Whether to wait for the response.
-
-        Returns:
-            RolloutScheduleInfo: The response from the rollout instance.
+            requests (RolloutScheduleInfo | List[RolloutScheduleInfo]): The requests to scatter.
+            instance_ids (List[int]): The list of instance ids.
         """
-        assert (
-            rollout_instance_id >= self.current_instance_offset
-            and rollout_instance_id < self.init_instance_num
+        if isinstance(requests, RolloutScheduleInfo):
+            requests = [requests] * len(instance_ids)
+        assert len(requests) == len(instance_ids), (
+            f"Try to send {len(requests)} requests to {len(instance_ids)} rollout instances."
+        )
+        tasks = [
+            asyncio.create_task(
+                self.channels[rollout_instance_id]
+                .put(
+                    request,
+                    queue_name=self.request_queue,
+                    async_op=True,
+                )
+                .async_wait()
+            )
+            for request, rollout_instance_id in zip(requests, instance_ids)
+        ]
+        await asyncio.gather(*tasks)
+
+    async def _gather_responses(
+        self,
+        instance_ids: List[int],
+    ) -> List[RolloutScheduleInfo]:
+        """Gather the responses from the rollout instances.
+
+        Args:
+            instance_ids (List[int]): The list of instance ids.
+        """
+        tasks = [
+            asyncio.create_task(
+                self.channels[rollout_instance_id]
+                .get(
+                    queue_name=self.response_queue,
+                    async_op=True,
+                )
+                .async_wait()
+            )
+            for rollout_instance_id in instance_ids
+        ]
+        responses: List[RolloutScheduleInfo] = await asyncio.gather(*tasks)
+        assert all(
+            response.instance_id == instance_id
+            for response, instance_id in zip(responses, instance_ids)
         ), (
-            f"rollout instance id={rollout_instance_id} is not in valid range=[{self.current_instance_offset}, {self.init_instance_num})"
+            f"expect to get responses from instance_ids={instance_ids}, "
+            f"but got from {[response.instance_id for response in responses]}"
         )
-
-        await self.channel.put(
-            request,
-            queue_name=get_scheduler_request_queue(rollout_instance_id),
-            async_op=True,
-        ).async_wait()
-
-        if not need_feedback:
-            return None
-
-        response = await self.channel.get(
-            queue_name=get_scheduler_response_queue(rollout_instance_id),
-            async_op=True,
-        ).async_wait()
-        assert response.instance_id == rollout_instance_id, (
-            f"rollout_instance_id={rollout_instance_id}, response={response}"
-        )
-        return response
+        return responses
 
     async def report(self):
         """Check the report of rollout instances."""
-        self.reports = [None for i in range(self.current_instance_num)]
-        report_request = RolloutScheduleInfo(action=RolloutAction.Report)
-        for instance_id in range(self.current_instance_num):
-            rollout_instance_id = instance_id + self.current_instance_offset
-            response = await self.send_request(report_request, rollout_instance_id)
-            assert response.report is not None
-            self.reports[instance_id] = response.report
+        alive_instance_ids = list(
+            range(self.current_instance_offset, self.init_instance_num)
+        )
+        await self._scatter_requests(
+            RolloutScheduleInfo(action=RolloutAction.Report),
+            alive_instance_ids,
+        )
+        responses = await self._gather_responses(alive_instance_ids)
+        self.reports = {response.instance_id: response.report for response in responses}
 
-        total_tasks = sum(report.total_tasks for report in self.reports)
-        self.running_tasks = sum(report.running_tasks for report in self.reports)
+        total_tasks = sum(report.total_tasks for report in self.reports.values())
+        self.running_tasks = sum(
+            report.running_tasks for report in self.reports.values()
+        )
 
         report_str = f"Rollout Report:\ncurrent_total_tasks={total_tasks}, current_running_tasks={self.running_tasks}\n"
-        for i, report in enumerate(self.reports):
-            report_str += f"rollout{i + self.current_instance_offset} : total_tasks={report.total_tasks}, running_tasks={report.running_tasks}, completed_tasks={report.completed_tasks}\n"
+        for instance_id, report in self.reports.items():
+            report_str += f"rollout{instance_id} : total_tasks={report.total_tasks}, running_tasks={report.running_tasks}, completed_tasks={report.completed_tasks}\n"
         return report_str
 
-    async def check_offloaded(self, finished_instance_ids: List[int]):
-        """Check if the rollout instances with id in in finished_instance_ids have been finished.
-
-        Args:
-            finished_instance_ids (List[int]): The list of finished instance ids.
-        """
-        for rollout_instance_id in finished_instance_ids:
-            response = await self.channel.get(
-                queue_name=get_scheduler_response_queue(rollout_instance_id),
-                async_op=True,
-            ).async_wait()
-            assert (
-                response.action == RolloutAction.Offloaded
-                and response.instance_id == rollout_instance_id
-            )
-
-    async def finish(self, action: RolloutAction) -> int:
+    async def finish(
+        self, action: RolloutAction, finished_instance_ids: List[int] | None = None
+    ) -> int:
         """Finish the rollout instances.
 
         Args:
             action (RolloutAction): The action to finish.
+            finished_instance_ids (List[int]): The list of finished instance ids. If None, finish all alive rollout instances.
 
         Returns:
             int: The number of released GPU resources.
         """
+        if not finished_instance_ids:
+            finished_instance_ids = [
+                i + self.current_instance_offset
+                for i in range(self.current_instance_num)
+            ]
         assert action in [RolloutAction.Finish, RolloutAction.Wait_For_Finish]
 
-        # Send action to all rollout instances
-        finished_instance_ids = []
-        for instance_id in range(self.current_instance_num):
-            rollout_instance_id = instance_id + self.current_instance_offset
-            await self.send_request(
-                RolloutScheduleInfo(action=action),
-                rollout_instance_id,
-                need_feedback=False,
-            )
-            finished_instance_ids.append(rollout_instance_id)
+        await self._scatter_requests(
+            RolloutScheduleInfo(action=action), finished_instance_ids
+        )
 
-        # Wait for all rollout instances to offload
-        await self.check_offloaded(finished_instance_ids)
+        responses = await self._gather_responses(finished_instance_ids)
+        assert all(response.action == RolloutAction.Offloaded for response in responses)
 
-        released_instance_num = self.current_instance_num
-        self.update(released_instance_num=released_instance_num)
-        return released_instance_num * self.model_parallel_size
+        self.update(released_instance_num=len(finished_instance_ids))
+        return len(finished_instance_ids) * self.model_parallel_size
 
-    async def migrate(self, migrate_instance_num: int) -> int:
-        """Execute the migration of rollout instances.
+    async def migrate_out(self, migrate_out_instance_ids: List[int]):
+        """Execute the Migrate_Out action.
 
         Args:
-            migrate_instance_num (int): The number of rollout instances to migrate out.
+            migrate_out_instance_ids (List[int]): The list of instance ids to migrate out.
 
         Returns:
-            int: The number of released GPU resources.
-
-        1. Send Migrate_Out signal to [current_instance_offset, current_instance_offset + migrate_instance_num) rollout instances
-        2. Collect the migrate batches from those rollout instances
-        3. Update the state of the ComponentManager
-        4. Send Migrate_In signal and migrate batches to alive rollout instances
-        5. Before return, check and wait for all migrate out instances to finish
+            List["SeqGroupInfo"]: The list of migrate out batches.
         """
-        if migrate_instance_num == 0:
-            return 0
-        assert migrate_instance_num < self.current_instance_num
-        assert len(self.reports) == self.current_instance_num
-
-        # Send Migrate_Out signal and collect the migrate batches
-        finished_instance_ids: List[int] = []
+        await self._scatter_requests(
+            RolloutScheduleInfo(action=RolloutAction.Migrate_Out),
+            migrate_out_instance_ids,
+        )
         migrate_out_batches: List["SeqGroupInfo"] = []
-        migrate_out_request = RolloutScheduleInfo(action=RolloutAction.Migrate_Out)
-        for instance_id in range(migrate_instance_num):
-            rollout_instance_id = instance_id + self.current_instance_offset
-            response = await self.send_request(
-                migrate_out_request,
-                rollout_instance_id,
-            )
+        responses = await self._gather_responses(migrate_out_instance_ids)
+        for response in responses:
             assert response.data is not None
-            migrate_out_batches += response.data
-            finished_instance_ids.append(rollout_instance_id)
+            migrate_out_batches.extend(response.data)
+        return migrate_out_batches
 
-        # Update the state of the ComponentManager
-        self.update(released_instance_num=migrate_instance_num)
+    async def migrate_in(
+        self,
+        migrate_in_instance_ids: List[int],
+        migrate_out_batches: List["SeqGroupInfo"],
+    ):
+        """Execute the Migrate_In action.
 
-        # Calculate the expected running tasks for each instance
-        instance_running_tasks_expected = (
-            self.running_tasks // self.current_instance_num
+        Args:
+            migrate_in_instance_ids (List[int]): The list of instance ids to migrate in.
+            migrate_out_batches (List["SeqGroupInfo"]): The list of migrate out batches.
+        """
+        instance_running_tasks_expected = max(
+            0, self.running_tasks // len(migrate_in_instance_ids)
         )
 
         migrate_out_batches_index = 0
@@ -464,21 +469,14 @@ class RolloutManager(ComponentManager):
             f"[Migrate-Info] migrate_out_batches_len: {migrate_out_batches_len}, migrate_out_tasks={migrate_out_tasks}, self.running_tasks={self.running_tasks}, instance_running_tasks_expected={instance_running_tasks_expected}"
         )
 
-        # Send Migrate_In signal and migrate batches to alive rollout instances
-        for instance_id in range(self.current_instance_num):
-            rollout_instance_id = instance_id + self.current_instance_offset
-            is_last_instance = instance_id == self.current_instance_num - 1
+        requests: List[RolloutScheduleInfo] = []
+        instance_ids: List[int] = []
 
-            report = self.reports[instance_id + migrate_instance_num]
-            running_tasks = report.running_tasks
-
-            # TODO::Need get all running tasks from rollout instance for this kind of case
-            if (
-                not is_last_instance
-                and running_tasks >= instance_running_tasks_expected
-            ):
+        for instance_id in migrate_in_instance_ids[:-1]:
+            running_tasks = self.reports[instance_id].running_tasks
+            if running_tasks >= instance_running_tasks_expected:
                 self._logger.info(
-                    f"Warning : rollout-{rollout_instance_id} has {running_tasks} running tasks >  expected {instance_running_tasks_expected}"
+                    f"Warning : rollout-{instance_id} has {running_tasks} running tasks >  expected {instance_running_tasks_expected}"
                 )
                 continue
 
@@ -491,34 +489,69 @@ class RolloutManager(ComponentManager):
                 migrate_out_batches_index += 1
                 running_tasks += migrate_batch.num_aborted
 
-            self._logger.info(
-                f"[Migrate-Info] rollout-{rollout_instance_id} migrate_in_batches: {len(migrate_in_batches)}, running_tasks={report.running_tasks} -> {running_tasks} ~= {instance_running_tasks_expected}"
-            )
-
-            if is_last_instance and (
-                migrate_out_batches_index != migrate_out_batches_len
-            ):
-                migrate_in_batches += migrate_out_batches[migrate_out_batches_index:]
-                running_tasks += sum(
-                    migrate_batch.num_aborted
-                    for migrate_batch in migrate_out_batches[migrate_out_batches_index:]
-                )
-                migrate_out_batches_index = migrate_out_batches_len
-                self._logger.info(
-                    f"[Migrate-Info] Error: migrate_out_batches split error, last-rollout instance get all data. running_tasks={running_tasks}"
-                )
-
             if len(migrate_in_batches) > 0:
                 migrate_in_request = RolloutScheduleInfo(
                     action=RolloutAction.Migrate_In, data=migrate_in_batches
                 )
-                await self.send_request(
-                    migrate_in_request, rollout_instance_id, need_feedback=False
-                )
-        assert migrate_out_batches_index == migrate_out_batches_len
+                requests.append(migrate_in_request)
+                instance_ids.append(instance_id)
 
-        # Wait for migrate out instances offloaded
-        await self.check_offloaded(finished_instance_ids)
+        if migrate_out_batches_index < len(migrate_out_batches):
+            migrate_in_request = RolloutScheduleInfo(
+                action=RolloutAction.Migrate_In,
+                data=migrate_out_batches[migrate_out_batches_index:],
+            )
+            requests.append(migrate_in_request)
+            instance_ids.append(migrate_in_instance_ids[-1])
+
+        migrate_out_msg = "[Migrate-Info]:\n"
+        for request, instance_id in zip(requests, instance_ids):
+            migrate_in_batches: List["SeqGroupInfo"] = request.data
+            running_tasks = self.reports[instance_id].running_tasks + sum(
+                batch.num_aborted for batch in migrate_in_batches
+            )
+            migrate_out_msg += f"rollout-{instance_id} : migrate_in_batches: {len(request.data)}, running_tasks={self.reports[instance_id].running_tasks} -> {running_tasks} ~= {instance_running_tasks_expected}\n"
+        self._logger.info(migrate_out_msg)
+
+        await self._scatter_requests(requests, instance_ids)
+
+    async def migrate(self, migrate_instance_num: int) -> int:
+        """Execute the migration of rollout instances.
+
+        Args:
+            migrate_instance_num (int): The number of rollout instances to migrate out.
+
+        Returns:
+            int: The number of released GPU resources.
+        """
+        if migrate_instance_num == 0:
+            return 0
+        assert migrate_instance_num < self.current_instance_num
+        assert len(self.reports) == self.current_instance_num
+
+        migrate_out_instance_ids = list(
+            range(
+                self.current_instance_offset,
+                self.current_instance_offset + migrate_instance_num,
+            )
+        )
+        migrate_in_instance_ids = list(
+            range(
+                self.current_instance_offset + migrate_instance_num,
+                self.init_instance_num,
+            )
+        )
+
+        # Migrate Out
+        migrate_out_batches: List["SeqGroupInfo"] = await self.migrate_out(
+            migrate_out_instance_ids
+        )
+
+        # Migrate In
+        await self.migrate_in(migrate_in_instance_ids, migrate_out_batches)
+
+        # Send Finish signal to migrate out instances to finish
+        await self.finish(RolloutAction.Finish, migrate_out_instance_ids)
 
         return migrate_instance_num * self.model_parallel_size
 
@@ -616,7 +649,7 @@ class InferenceManager(ComponentManager):
             channel_factory=channel_factory,
             _logger=_logger,
         )
-        self.create_channel(1)
+        self.create_channels(1)
 
     async def wait_for_finish(self) -> int:
         """Last train iter process.
@@ -635,8 +668,8 @@ class InferenceManager(ComponentManager):
 
         Initialize the main loop finished handler.
         """
-        self.main_loop_finished_handler = self.channel.get(
-            queue_name=get_scheduler_response_queue(), async_op=True
+        self.main_loop_finished_handler = self.channels[0].get(
+            queue_name=self.response_queue, async_op=True
         )
 
     async def main_loop_finalize(self):
@@ -712,7 +745,7 @@ class ActorManager(ComponentManager):
             channel_factory=channel_factory,
             _logger=_logger,
         )
-        self.create_channel(1)
+        self.create_channels(1)
 
         assert hasattr(self, "current_instance_num")
 
@@ -723,9 +756,11 @@ class ActorManager(ComponentManager):
         """
         if not self.use_pre_process_policy:
             return
-        await self.channel.put(
-            None, queue_name=get_scheduler_request_queue(), async_op=True
-        ).async_wait()
+        await (
+            self.channels[0]
+            .put(None, queue_name=self.request_queue, async_op=True)
+            .async_wait()
+        )
 
     def try_allocate(
         self, available_gpu_num: int, actor_valid_dp_sizes: List[int]
@@ -766,11 +801,15 @@ class ActorManager(ComponentManager):
         if new_gpu_num == self.current_gpu_num:
             scale_info = None
 
-        await self.channel.put(
-            scale_info,
-            queue_name=get_scheduler_request_queue(),
-            async_op=True,
-        ).async_wait()
+        await (
+            self.channels[0]
+            .put(
+                scale_info,
+                queue_name=self.request_queue,
+                async_op=True,
+            )
+            .async_wait()
+        )
 
         if new_gpu_num > self.current_gpu_num:
             incremental_instance_num = (
@@ -815,9 +854,11 @@ class ActorManager(ComponentManager):
 
     async def wait_for_actor_update(self):
         """Wait for the actor update."""
-        await self.channel.get(
-            queue_name=get_scheduler_response_queue(), async_op=True
-        ).async_wait()
+        await (
+            self.channels[0]
+            .get(queue_name=self.response_queue, async_op=True)
+            .async_wait()
+        )
 
     async def release_resource(self, *args, **kwargs) -> int:
         """Release the GPU resources.
@@ -869,8 +910,8 @@ class RolloutScalingScheduler:
         """
         self._rank = rank
         self.scheduler_channel = scheduler_channel
-        self.scheduler_request_queue = get_scheduler_request_queue(self._rank)
-        self.scheduler_response_queue = get_scheduler_response_queue(self._rank)
+        self.scheduler_request_queue = get_scheduler_request_queue()
+        self.scheduler_response_queue = get_scheduler_response_queue()
         self.worker = worker
         self.status_manager = self.worker.status_manager
 
@@ -904,9 +945,6 @@ class RolloutScalingScheduler:
             queue_name=self.scheduler_response_queue,
             async_op=True,
         ).async_wait()
-
-        # Notify rollout() to exit.
-        self.status_manager.notify()
 
     async def _migrate_in(self, scheduler_request: RolloutScheduleInfo):
         seq_groups: List["SeqGroupInfo"] = scheduler_request.data
