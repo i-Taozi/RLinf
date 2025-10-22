@@ -77,7 +77,7 @@ class SGLangWorker(Worker):
 
     def _init_scheduler(self):
         self.schedule_channel = self.connect_channel(
-            get_scheduler_channel("rollout"), self._rank
+            get_scheduler_channel("rollout", self._rank)
         )
 
         self._scheduler = RolloutScalingScheduler(
