@@ -258,7 +258,10 @@ class RolloutManager(ComponentManager):
 
         while True:
             report_str = await self.report()
-            if self.running_tasks <= running_tasks_threshold:
+            if (
+                self.total_tasks == self.rollout_total_tasks
+                and self.running_tasks <= running_tasks_threshold
+            ):
                 self._logger.info("\npre_process condition satisfied:\n" + report_str)
                 await self.migrate(migrate_out_instance_num)
                 break
@@ -388,12 +391,12 @@ class RolloutManager(ComponentManager):
         responses = await self._gather_responses(alive_instance_ids)
         self.reports = {response.instance_id: response.report for response in responses}
 
-        total_tasks = sum(report.total_tasks for report in self.reports.values())
+        self.total_tasks = sum(report.total_tasks for report in self.reports.values())
         self.running_tasks = sum(
             report.running_tasks for report in self.reports.values()
         )
 
-        report_str = f"Rollout Report:\ncurrent_total_tasks={total_tasks}, current_running_tasks={self.running_tasks}\n"
+        report_str = f"Rollout Report:\ncurrent_total_tasks={self.total_tasks}, current_running_tasks={self.running_tasks}\n"
         for instance_id, report in self.reports.items():
             report_str += f"rollout{instance_id} : total_tasks={report.total_tasks}, running_tasks={report.running_tasks}, completed_tasks={report.completed_tasks}\n"
         return report_str
