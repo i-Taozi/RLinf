@@ -31,7 +31,7 @@ from rlinf.scheduler.dynamic_scheduler.utils import (
     get_scheduler_request_queue,
     get_scheduler_response_queue,
 )
-from rlinf.utils.placement import ComponentPlacement
+from rlinf.utils.placement import ModelParallelComponentPlacement
 
 if TYPE_CHECKING:
     from rlinf.data.io_struct import SeqGroupInfo
@@ -52,7 +52,7 @@ class ComponentManager(ABC):
         self,
         component_role: str,
         config: DictConfig,
-        component_placement: ComponentPlacement,
+        component_placement: ModelParallelComponentPlacement,
         use_pre_process_policy: bool,
         use_wait_before_last_iter_policy: bool,
         channel_factory: Callable[[str], Channel],
@@ -63,7 +63,7 @@ class ComponentManager(ABC):
         Args:
             component_role (str): The role of the component.
             config (DictConfig): The configuration of this training task.
-            component_placement (ComponentPlacement): The component placement.
+            component_placement (ModelParallelComponentPlacement): The component placement.
             use_pre_process_policy (bool): Whether to use the pre-process policy.
             use_wait_before_last_iter_policy (bool): Whether to use the wait before last iter policy.
             channel_factory (Callable[[str], Channel]): The factory for creating channels.
@@ -97,7 +97,7 @@ class ComponentManager(ABC):
         Args:
             channel_num (int): The number of channel.
         """
-        self.channels = []
+        self.channels: List[Channel] = []
         self.request_queue = get_scheduler_request_queue()
         self.response_queue = get_scheduler_response_queue()
         for instance_id in range(channel_num):
@@ -164,12 +164,12 @@ class ComponentManager(ABC):
     @abstractmethod
     async def pre_process_impl(self, *args, **kwargs):
         """Implement of pre_process."""
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     async def main_loop_finalize(self):
         """Processing after the last training iteration in main_loop."""
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     async def release_resource(self, *args, **kwargs) -> int:
@@ -178,7 +178,7 @@ class ComponentManager(ABC):
         Returns:
             int: The number of released GPU resources.
         """
-        raise NotImplementedError
+        ...
 
     @abstractmethod
     async def allocate_resource(self, *args, **kwargs) -> int:
@@ -187,7 +187,7 @@ class ComponentManager(ABC):
         Returns:
             int: The number of incremental GPU resources.
         """
-        raise NotImplementedError
+        ...
 
 
 class RolloutManager(ComponentManager):
@@ -206,7 +206,7 @@ class RolloutManager(ComponentManager):
     def __init__(
         self,
         config: DictConfig,
-        component_placement: ComponentPlacement,
+        component_placement: ModelParallelComponentPlacement,
         use_pre_process_policy: bool,
         use_wait_before_last_iter_policy: bool,
         channel_factory: Callable[[str], Channel],
@@ -374,16 +374,17 @@ class RolloutManager(ComponentManager):
             response.instance_id == instance_id
             for response, instance_id in zip(responses, instance_ids)
         ), (
-            f"expect to get responses from instance_ids={instance_ids}, "
+            f"Expect to get responses from instance_ids={instance_ids}, "
             f"but got from {[response.instance_id for response in responses]}"
         )
         return responses
 
+    def _get_running_instances(self) -> List[int]:
+        return list(range(self.current_instance_offset, self.init_instance_num))
+
     async def report(self):
         """Check the report of rollout instances."""
-        alive_instance_ids = list(
-            range(self.current_instance_offset, self.init_instance_num)
-        )
+        alive_instance_ids = self._get_running_instances()
         await self._scatter_requests(
             RolloutScheduleInfo(action=RolloutAction.Report),
             alive_instance_ids,
@@ -413,11 +414,8 @@ class RolloutManager(ComponentManager):
         Returns:
             int: The number of released GPU resources.
         """
-        if not finished_instance_ids:
-            finished_instance_ids = [
-                i + self.current_instance_offset
-                for i in range(self.current_instance_num)
-            ]
+        if finished_instance_ids is None:
+            finished_instance_ids = self._get_running_instances()
         assert action in [RolloutAction.Finish, RolloutAction.Wait_For_Finish]
 
         await self._scatter_requests(
@@ -429,6 +427,93 @@ class RolloutManager(ComponentManager):
 
         self.update(released_instance_num=len(finished_instance_ids))
         return len(finished_instance_ids) * self.model_parallel_size
+
+    def _assign_sequences_sequential(
+        self,
+        migrate_in_instance_ids: List[int],
+        migrate_in_instance_reports: List[RolloutReport],
+        migrate_out_batches: List["SeqGroupInfo"],
+    ) -> List[List["SeqGroupInfo"]]:
+        assert len(migrate_in_instance_ids) == len(migrate_in_instance_reports), (
+            f"Get {len(migrate_in_instance_ids)} instance ids != {len(migrate_in_instance_reports)} reports."
+        )
+        instance_running_tasks_expected = max(
+            0, self.running_tasks // len(migrate_in_instance_ids)
+        )
+        migrate_out_batches_index = 0
+        migrate_out_batches_len = len(migrate_out_batches)
+
+        batches_assigned: List[List["SeqGroupInfo"]] = []
+        for in_id, report in zip(
+            migrate_in_instance_ids[:-1], migrate_in_instance_reports[:-1]
+        ):
+            running_tasks = report.running_tasks
+            if running_tasks >= instance_running_tasks_expected:
+                self._logger.info(
+                    f"Warning : rollout-{in_id} has {running_tasks} running tasks "
+                    f"> expected {instance_running_tasks_expected}"
+                )
+                batches_assigned.append([])
+                continue
+
+            migrate_in_batches = []
+            while (migrate_out_batches_index < migrate_out_batches_len) and (
+                running_tasks < instance_running_tasks_expected
+            ):
+                migrate_batch = migrate_out_batches[migrate_out_batches_index]
+                migrate_in_batches.append(migrate_batch)
+                migrate_out_batches_index += 1
+                running_tasks += migrate_batch.num_aborted
+
+            batches_assigned.append(migrate_in_batches)
+
+        if migrate_out_batches_index < migrate_out_batches_len:
+            migrate_in_batches = migrate_out_batches[migrate_out_batches_index:]
+            running_tasks = sum(
+                migrate_batch.num_aborted
+                for migrate_batch in migrate_out_batches[migrate_out_batches_index:]
+            )
+
+            batches_assigned.append(migrate_in_batches)
+
+        return batches_assigned
+
+    def assign_sequences(
+        self,
+        migrate_in_instance_ids: List[int],
+        migrate_in_instance_reports: List[RolloutReport],
+        migrate_out_batches: List["SeqGroupInfo"],
+        algo: str = "sequential",
+    ) -> List[List["SeqGroupInfo"]]:
+        """Assign sequences to instances based on the specified algorithm.
+
+        This method handles the assignment of sequences to instances during
+        migration. It supports different algorithms for the assignment process.
+
+        Args:
+            migrate_in_instance_ids (List[int]): A list of instance IDs that are
+                migrating in.
+            migrate_in_instance_reports (List[RolloutReport]): A list of rollout
+                reports corresponding to the instances that are migrating in.
+            migrate_out_batches (List["SeqGroupInfo"]): A list of sequence group
+                information for the batches that are migrating out.
+            algo (str, optional): The algorithm to use for assigning sequences.
+                Defaults to "sequential". Currently, only "sequential" is supported.
+
+        Returns:
+            The result of the sequence assignment process, as determined by the
+            selected algorithm. It has the same length as migrate_in_instance_ids.
+            If an instance is not assigned any batches, the corresponding entry is an
+            empty list.
+        """
+        if algo == "sequential":
+            return self._assign_sequences_sequential(
+                migrate_in_instance_ids,
+                migrate_in_instance_reports,
+                migrate_out_batches,
+            )
+        else:
+            raise ValueError(f"Unexpected migration assigning algorithm: {algo}")
 
     async def migrate_out(self, migrate_out_instance_ids: List[int]):
         """Execute the Migrate_Out action.
@@ -464,59 +549,51 @@ class RolloutManager(ComponentManager):
         instance_running_tasks_expected = max(
             0, self.running_tasks // len(migrate_in_instance_ids)
         )
-
-        migrate_out_batches_index = 0
-        migrate_out_batches_len = len(migrate_out_batches)
-        migrate_out_tasks = sum(batch.num_aborted for batch in migrate_out_batches)
         self._logger.info(
-            f"[Migrate-Info] migrate_out_batches_len: {migrate_out_batches_len}, migrate_out_tasks={migrate_out_tasks}, self.running_tasks={self.running_tasks}, instance_running_tasks_expected={instance_running_tasks_expected}"
+            f"[Migrate-Info] "
+            f"migrate_out_batches_len={len(migrate_out_batches)}, "
+            f"migrate_out_tasks={sum(batch.num_aborted for batch in migrate_out_batches)}, "
+            f"{self.running_tasks=}, "
+            f"{instance_running_tasks_expected=}"
         )
 
-        requests: List[RolloutScheduleInfo] = []
-        instance_ids: List[int] = []
+        migrate_in_instance_reports = [
+            self.reports[instance_id] for instance_id in migrate_in_instance_ids
+        ]
 
-        for instance_id in migrate_in_instance_ids[:-1]:
-            running_tasks = self.reports[instance_id].running_tasks
-            if running_tasks >= instance_running_tasks_expected:
-                self._logger.info(
-                    f"Warning : rollout-{instance_id} has {running_tasks} running tasks >  expected {instance_running_tasks_expected}"
-                )
-                continue
+        assigned_batches = self.assign_sequences(
+            migrate_in_instance_ids,
+            migrate_in_instance_reports,
+            migrate_out_batches,
+            algo="sequential",
+        )
 
-            migrate_in_batches = []
-            while (migrate_out_batches_index < migrate_out_batches_len) and (
-                running_tasks < instance_running_tasks_expected
-            ):
-                migrate_batch = migrate_out_batches[migrate_out_batches_index]
-                migrate_in_batches.append(migrate_batch)
-                migrate_out_batches_index += 1
-                running_tasks += migrate_batch.num_aborted
+        migrate_in_ids: List[int] = []
+        migrate_in_requests: List[RolloutScheduleInfo] = []
 
-            if len(migrate_in_batches) > 0:
+        for instance_id, batches in zip(migrate_in_instance_ids, assigned_batches):
+            if len(batches) > 0:
                 migrate_in_request = RolloutScheduleInfo(
-                    action=RolloutAction.Migrate_In, data=migrate_in_batches
+                    action=RolloutAction.Migrate_In, data=batches
                 )
-                requests.append(migrate_in_request)
-                instance_ids.append(instance_id)
-
-        if migrate_out_batches_index < len(migrate_out_batches):
-            migrate_in_request = RolloutScheduleInfo(
-                action=RolloutAction.Migrate_In,
-                data=migrate_out_batches[migrate_out_batches_index:],
-            )
-            requests.append(migrate_in_request)
-            instance_ids.append(migrate_in_instance_ids[-1])
+                migrate_in_requests.append(migrate_in_request)
+                migrate_in_ids.append(instance_id)
 
         migrate_out_msg = "[Migrate-Info]:\n"
-        for request, instance_id in zip(requests, instance_ids):
+        for request, instance_id in zip(migrate_in_requests, migrate_in_ids):
             migrate_in_batches: List["SeqGroupInfo"] = request.data
             running_tasks = self.reports[instance_id].running_tasks + sum(
                 batch.num_aborted for batch in migrate_in_batches
             )
-            migrate_out_msg += f"rollout-{instance_id} : migrate_in_batches: {len(request.data)}, running_tasks={self.reports[instance_id].running_tasks} -> {running_tasks} ~= {instance_running_tasks_expected}\n"
+            migrate_out_msg += (
+                f"rollout-{instance_id} : "
+                f"migrate_in_batches: {len(request.data)}, "
+                f"running_tasks={self.reports[instance_id].running_tasks} "
+                f"-> {running_tasks} ~= {instance_running_tasks_expected}\n"
+            )
         self._logger.info(migrate_out_msg)
 
-        await self._scatter_requests(requests, instance_ids)
+        await self._scatter_requests(migrate_in_requests, migrate_in_ids)
 
     async def migrate(self, migrate_instance_num: int) -> int:
         """Execute the migration of rollout instances.
@@ -532,23 +609,12 @@ class RolloutManager(ComponentManager):
         assert migrate_instance_num < self.current_instance_num
         assert len(self.reports) == self.current_instance_num
 
-        migrate_out_instance_ids = list(
-            range(
-                self.current_instance_offset,
-                self.current_instance_offset + migrate_instance_num,
-            )
-        )
-        migrate_in_instance_ids = list(
-            range(
-                self.current_instance_offset + migrate_instance_num,
-                self.init_instance_num,
-            )
-        )
+        running_instance_ids = self._get_running_instances()
+        migrate_out_instance_ids = running_instance_ids[:migrate_instance_num]
+        migrate_in_instance_ids = running_instance_ids[migrate_instance_num:]
 
         # Migrate Out
-        migrate_out_batches: List["SeqGroupInfo"] = await self.migrate_out(
-            migrate_out_instance_ids
-        )
+        migrate_out_batches = await self.migrate_out(migrate_out_instance_ids)
 
         # Migrate In
         await self.migrate_in(migrate_in_instance_ids, migrate_out_batches)
@@ -636,7 +702,7 @@ class InferenceManager(ComponentManager):
     def __init__(
         self,
         config: DictConfig,
-        component_placement: ComponentPlacement,
+        component_placement: ModelParallelComponentPlacement,
         use_pre_process_policy: bool,
         use_wait_before_last_iter_policy: bool,
         channel_factory: Callable[[str], Channel],
@@ -732,7 +798,7 @@ class ActorManager(ComponentManager):
     def __init__(
         self,
         config: DictConfig,
-        component_placement: ComponentPlacement,
+        component_placement: ModelParallelComponentPlacement,
         use_pre_process_policy: bool,
         use_wait_before_last_iter_policy: bool,
         channel_factory: Callable[[str], Channel],
@@ -995,10 +1061,6 @@ class RolloutScalingScheduler:
             request: RolloutScheduleInfo = await self.scheduler_channel.get(
                 queue_name=self.scheduler_request_queue, async_op=True
             ).async_wait()
-            if request.action != RolloutAction.Report:
-                self.worker.log_info(
-                    f"Received scheduler request action: {request.action}"
-                )
 
             match request.action:
                 case RolloutAction.Report:

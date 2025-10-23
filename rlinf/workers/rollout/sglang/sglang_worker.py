@@ -211,7 +211,8 @@ class SGLangWorker(Worker):
             sampling_params (List[Dict] | Dict | None): Same as SGLang engine's sampling_params argument.
             input_ids (List[List[int]] | List[int] | None): Same as SGLang engine's input_ids argument.
             return_logprob (List[bool] | bool | None): Same as SGLang engine's return_logprob argument.
-            request_info (Any | None): Any additional request info you wish to be associated with this generation request. This argument will not be passed to the SGLang engine and returned directly.
+            request_info (Any | None): Any additional request info you wish to be associated with this
+                generation request. This argument will not be passed to the SGLang engine and returned directly.
 
         Returns:
             Tuple[Dict, Any | None]: A tuple containing the engine result and the original request_info.
@@ -223,7 +224,6 @@ class SGLangWorker(Worker):
             image_data=image_data if any(image_data) else None,
             return_logprob=return_logprob,
         )
-        # SGLang does not return input_ids, so we need to pass them for further usage.
         return result, request_info
 
     async def init_worker(self):
