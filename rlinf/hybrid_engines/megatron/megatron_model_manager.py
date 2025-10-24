@@ -160,7 +160,7 @@ class MegatronModelManager:
                     self.transformer_config,
                     use_te,
                 ),
-                vocab_size=self._cfg.model.override_vocab_size,
+                vocab_size=self._cfg.model.padded_vocab_size,
                 max_sequence_length=self._cfg.model.max_position_embeddings,
                 pre_process=pre_process,
                 post_process=post_process,
