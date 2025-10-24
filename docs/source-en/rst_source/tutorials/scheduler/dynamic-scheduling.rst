@@ -1,5 +1,5 @@
 Dynamic Scheduling
-========================
+==================
 
 
 Dynamic scheduling adjusts and migrates resources among components (actor / rollout / inference)
@@ -8,7 +8,7 @@ It relies on Megatron-LM's online scaling (second-level elasticity) and SGLang's
 to reallocate GPU resources without stopping training.
 
 What is Dynamic Scheduling?
------------------------
+---------------------------
 
 Dynamic scheduling adjusts GPU resources across components during training based on stage-specific
 bottlenecks and workload changes:
@@ -31,7 +31,7 @@ Benefits and Effects
 - Consistency preserved: training/model state remains consistent during scaling
 
 How to Use Dynamic Scheduling
---------------------
+-----------------------------
 
 Prerequisites
 ^^^^^^^^^^^^
@@ -40,27 +40,26 @@ Prerequisites
 
 .. code-block:: bash
 
-    cd YourPath
+    cd YourWorkspace
     git clone git@github.com:i-Taozi/params_resharding_release.git
-    export PYTHONPATH=$PYTHONPATH:YourPath/params_resharding_release
+    export PYTHONPATH=$PYTHONPATH:YourWorkspace/params_resharding_release
 
-This repository provides the compiled artifacts for Megatron-LM online scaling (source not yet open-sourced).
+This repository provides the compiled artifacts for Megatron-LM online scaling. The source code will be released in future.
 
 2) Megatron must be version 0.11. If your environment is not 0.11, fetch 0.11 separately:
 
 .. code-block:: bash
 
-    cd YourPath
+    cd YourWorkspace
     git clone git@github.com:NVIDIA/Megatron.git
     cd Megatron-LM
     git checkout core_r0.11.0
-    export PYTHONPATH=$PYTHONPATH:YourPath/Megatron-LM
+    export PYTHONPATH=$PYTHONPATH:YourWorkspace/Megatron-LM
 
-Configuration Example (Disaggregated Pipeline)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Configuration Example
+^^^^^^^^^^^^^^^^^^^^^
 
-Original configuration:
-
+Disaggregated Pipeline configuration:
 .. code-block:: yaml
 
     cluster:
@@ -70,8 +69,8 @@ Original configuration:
         inference: 4-5
         actor: 6-7
 
-Change to enable the auto scheduler and ensure the component order actor -> rollout -> inference:
-
+Based on the disaggregated pipeline configuration, change the component order and enable the auto scheduler.
+Make sure the component order is actor -> rollout -> inference, otherwise the actor can't scale up.
 .. code-block:: yaml
 
     cluster:
@@ -85,7 +84,7 @@ Change to enable the auto scheduler and ensure the component order actor -> roll
         inference: 6-7
 
 Scheduling Logic
---------------------
+----------------
 
 When dynamic scheduling is enabled, the runtime scheduler monitors component progress and queues
 and decides whether to adjust resources. Typical actions include:
@@ -94,7 +93,7 @@ and decides whether to adjust resources. Typical actions include:
 - When rollout or inference finishes: release resources to expand the actor
 
 Optional Policies
-^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^
 
 - use_pre_process_policy
 
