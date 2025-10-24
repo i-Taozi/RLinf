@@ -135,6 +135,7 @@ class MegatronModelManager:
         config = build_config(ModelConfig, cfg.model)
         self.flops_calculator = FLOPSCalculator(config)
 
+        # In AUTO mode, the actor will occupy all GPUs for initialization, but not all Megatron processes will be in the running state.
         self.is_running = True
 
     def setup_model_and_optimizer(self, model_type=ModelType.encoder_or_decoder):

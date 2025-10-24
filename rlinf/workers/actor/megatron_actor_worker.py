@@ -204,7 +204,9 @@ class MegatronActor(MegatronModelManager, Worker):
             )
 
         self._init_profiler()
+        self._init_auto_scheduler(role)
 
+    def _init_auto_scheduler(self, role: str):
         self.use_auto_scheduler = (
             self.component_placement._placement_mode == PlacementMode.AUTO
         )
@@ -832,7 +834,7 @@ class MegatronActor(MegatronModelManager, Worker):
                 training_metrics = self.training_step(train_batch_iterator)
                 train_batch_iterator.check_finished_global_batch()
                 training_metrics_list.append(training_metrics)
-            self.scheduler_main_loop()
+            self.scheduler_scale_sync()
 
         # Gather weights if overlap_param_gather before the next weight sync
         self._gather_weights_among_dp()
@@ -844,11 +846,9 @@ class MegatronActor(MegatronModelManager, Worker):
         return rollout_metrics, training_metrics_list
 
     # Elastic-Training
-    def sync_with_scheduler(self, update_state: bool):
-        if not self.use_auto_scheduler:
-            return None
+    def get_scheduler_response(self, send_request_first: bool):
         if self._rank == 0:
-            if update_state:
+            if send_request_first:
                 self.schedule_channel.put(
                     None, queue_name=self.scheduler_response_queue, async_op=True
                 ).wait()
@@ -861,19 +861,22 @@ class MegatronActor(MegatronModelManager, Worker):
         return self.broadcast_obj(response)
 
     def scheduler_pre_process(self):
+        """Wait for the scheduler to send the pre-process response."""
         if not self.use_pre_process_policy:
             return
-        self.sync_with_scheduler(False)
+        self.get_scheduler_response(False)
 
-    def scheduler_main_loop(self):
+    def scheduler_scale_sync(self):
+        """Get a resharding response from the scheduler and apply this resharding response if it's not None."""
         if not self.use_auto_scheduler:
             return
-        resharding_response = self.sync_with_scheduler(True)
+        resharding_response = self.get_scheduler_response(True)
         if resharding_response is not None:
             self.apply_parallel_strategy(resharding_response)
             self.calc_num_microbatches()
 
     def scheduler_offload_sync(self):
+        """Send offloaded signal to the scheduler."""
         inference_world_size = self.component_placement.inference_world_size
         if inference_world_size == 0 or not self.use_auto_scheduler:
             return
