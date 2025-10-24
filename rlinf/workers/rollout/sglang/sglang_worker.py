@@ -286,17 +286,18 @@ class SGLangWorker(Worker):
         else:
             # Have aborted sequences (e.g., migrated from other engines)
             # Continue generation for the aborted group
-            seq_idx_list = seq_group_info.idx_aborted.copy()
+            idx_aborted = seq_group_info.idx_aborted.copy()
+            seq_idx_list: List[int] = []
             seq_group_info.idx_aborted.clear()
             input_batch: List[List[int]] = []
             sampling_params_list: List[Dict] = []
             image_data_list: List = []
-            for idx in seq_idx_list:
+            for idx in idx_aborted:
                 generated_ids: List[int] = seq_group_info.results[idx]["output_ids"]
                 if len(generated_ids) >= self._sampling_params["max_new_tokens"]:
                     # avoid genererating for sequences that have already meet their max_new_tokens
                     self.log_warning(
-                        f"SeqGroup {seq_group_info.id} idx {seq_group_info.results[idx]} "
+                        f"SeqGroup {seq_group_info.id} idx {idx} "
                         f"has generated {len(generated_ids)} tokens, "
                         f"exceeding max_new_tokens={self._sampling_params['max_new_tokens']}, "
                         f"it will be truncatured."
@@ -305,6 +306,7 @@ class SGLangWorker(Worker):
                     result["meta_info"]["finish_reason"]["type"] = "length"
                     seq_group_info.record_sglang_result(idx, result)
                     continue
+                seq_idx_list.append(idx)
                 input_batch.append(seq_group_info.input_ids + generated_ids)
                 params = self._sampling_params.copy()
                 params["max_new_tokens"] -= len(generated_ids)
