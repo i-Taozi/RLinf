@@ -193,9 +193,6 @@ class MegatronActor(MegatronModelManager, Worker):
 
         # Config validation
         if self.is_pipeline:
-            assert not self.cfg.algorithm.normalize_advantages, (
-                "Advantage normalization is not supported in pipeline mode."
-            )
             assert not self.role_cfg.get("enable_dp_load_balance", False), (
                 "DP load balance is not supported in pipeline mode."
             )
@@ -808,9 +805,14 @@ class MegatronActor(MegatronModelManager, Worker):
         )
 
         # Advantage normalization
-        assert not self.cfg.algorithm.normalize_advantages, (
-            "Advantage normalization is not supported in pipeline mode."
-        )
+        if self.cfg.algorithm.normalize_advantages:
+
+            def normalize_advantages(batch: Dict[str, torch.Tensor]):
+                mask = batch["attention_mask"][:, -self.response_len :]
+                batch["advantages"] = masked_normalization(batch["advantages"], mask)
+                return batch
+
+            train_batch_iterator.register_global_batch_handler(normalize_advantages)
 
         # Valid token scale
         if self.cfg.algorithm.use_valid_token_scale:
