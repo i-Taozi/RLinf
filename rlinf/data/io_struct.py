@@ -135,65 +135,6 @@ class RolloutRequest:
 
         return splitted_requests
 
-    def repeat_and_split(
-        self, rollout_batch_size: Optional[int] = None
-    ) -> List["RolloutRequest"]:
-        input_ids, answers, image_data, multi_modal_inputs = zip(
-            *[
-                (input_id, answer, image_data, multi_modal_inputs)
-                for input_id, answer, image_data, multi_modal_inputs in zip(
-                    self.input_ids,
-                    self.answers,
-                    self.image_data,
-                    self.multi_modal_inputs,
-                )
-                for _ in range(self.n)
-            ]
-        )
-        input_ids, answers, image_data, multi_modal_inputs = (
-            list(input_ids),
-            list(answers),
-            list(image_data),
-            list(multi_modal_inputs),
-        )
-
-        # Split input ids based on rollout_batch_size_per_gpu
-        if rollout_batch_size is None:
-            num_batches = 1
-        else:
-            assert len(input_ids) % rollout_batch_size == 0, (
-                f"Input IDs length {len(input_ids)} is not divisible by rollout batch size {rollout_batch_size}"
-            )
-            num_batches = len(input_ids) // rollout_batch_size
-
-        splitted_requests = []
-        input_ids_split_list = split_list(input_ids, num_batches)
-        answers_split_list = split_list(answers, num_batches)
-        image_data_split_list = split_list(image_data, num_batches)
-        multi_modal_inputs_split_list = split_list(multi_modal_inputs, num_batches)
-
-        for (
-            input_ids_batch,
-            answers_batch,
-            image_data_batch,
-            multi_modal_inputs_batch,
-        ) in zip(
-            input_ids_split_list,
-            answers_split_list,
-            image_data_split_list,
-            multi_modal_inputs_split_list,
-        ):
-            request = RolloutRequest(
-                n=self.n,
-                input_ids=input_ids_batch,
-                answers=answers_batch,
-                image_data=image_data_batch,
-                multi_modal_inputs=multi_modal_inputs_batch,
-            )
-            splitted_requests.append(request)
-
-        return splitted_requests
-
     def to_seq_group_infos(self) -> List["SeqGroupInfo"]:
         """Convert the RolloutRequest into a list of SeqGroupInfo objects.
 
@@ -240,30 +181,6 @@ class SeqGroupInfo:
         idx_completed (set[int]): Set of indices for sequences that have completed rollout and are ready for evaluation.
         idx_aborted (set[int]): Set of indices for sequences that have been aborted. These sequences need to be re-rolled out before they can be evaluated.
         results (List[Optional[Dict]]): List storing result dictionaries for each sequence, or None if not yet available.
-
-    Methods:
-        record_sglang_result(idx: int, result: Dict):
-            Records the result for a sequence at the given index.
-            Updates completion or abortion status based on the result's finish reason.
-            Handles overwriting of existing results and concatenates output IDs if necessary.
-
-        num_completed (int):
-            Returns the number of completed sequences.
-
-        num_aborted (int):
-            Returns the number of aborted sequences.
-
-        num_returned (int):
-            Returns the total number of sequences that have either completed or aborted.
-
-        num_running (int):
-            Returns the number of sequences still running.
-
-        all_returned (bool):
-            Returns True if all sequences have either completed or aborted.
-
-        all_completed (bool):
-            Returns True if all sequences have completed.
     """
 
     id: int
@@ -283,6 +200,26 @@ class SeqGroupInfo:
         self.results = [None for _ in range(self.group_size)]
 
     def record_sglang_result(self, idx: int, result: Dict, logger=None):
+        """Record a single sglang execution result and update internal tracking.
+
+        This method is responsible for updating the internal state of the SeqGroupInfo
+        instance based on the result of a single sglang execution. It accepts the index of the
+        sequence within the group and the result dictionary returned by sglang. Then it updates
+        the sets of completed and aborted indices based on the finish reason provided in the result.
+        If the result for the given index already exists, indicating that this is a re-rollout
+        sequence, this method will merge the new result with the previous one by concatenating the output IDs.
+
+        Args:
+            idx: int
+                The index of the sequence within the group (0 <= idx < group_size).
+            result: Dict
+                Result of SGLang. Expected to contain at least:
+                - "meta_info": {"finish_reason": {"type": FinishReasonEnum}}
+                - "output_ids": a list (or list-like) of output identifier elements
+            logger: optional
+                Optional logger for diagnostic messages.
+        """
+
         finished_reason = result["meta_info"]["finish_reason"]["type"]
         match finished_reason:
             case FinishReasonEnum.ABORT:
@@ -303,26 +240,32 @@ class SeqGroupInfo:
 
     @property
     def num_completed(self) -> int:
+        """Returns the number of completed sequences."""
         return len(self.idx_completed)
 
     @property
     def num_aborted(self) -> int:
+        """Returns the number of aborted sequences."""
         return len(self.idx_aborted)
 
     @property
     def num_returned(self) -> int:
+        """Returns the total number of sequences that have either completed or aborted."""
         return self.num_completed + self.num_aborted
 
     @property
     def num_running(self) -> int:
+        """Returns the number of sequences still running."""
         return self.group_size - self.num_returned
 
     @property
     def all_returned(self) -> bool:
+        """Returns True if all sequences have either completed or aborted."""
         return self.num_returned == self.group_size
 
     @property
     def all_completed(self) -> bool:
+        """Returns True if all sequences have completed."""
         return self.num_completed == self.group_size
 
 
@@ -974,6 +917,7 @@ class BatchResizingIterator:
         self.global_batch_done = False
         self.batches = []
         self.get_batch_fn_handler = None
+        self.global_batch_handler: Optional[Callable] = None
 
     def register_get_batch_handler(self, handler: Callable):
         """This enables processing a batch after calling self.get_batch_fn.
@@ -1032,6 +976,28 @@ class BatchResizingIterator:
                 )
         return micro_batch
 
+    def register_global_batch_handler(self, handler: Callable):
+        """This enables processing a global batch before it's splitting into microbatches and consumed.
+
+        Args:
+            handler (Callable): The handler function to process the global batch. This function will receive a single argument, which is the global batch to process, and returns the processed global batch.
+        """
+        self.global_batch_handler = handler
+
+    def _fill_global_batches(self, current_batch: Dict[str, torch.Tensor]):
+        """Keep getting batches until the batch size is multiple of a global batch if requires_global_batch."""
+        current_batch_size = current_batch[self.batch_tensor_key].shape[0]
+        while (
+            current_batch_size < self.global_batch_size
+            and current_batch_size % self.global_batch_size != 0
+        ):
+            new_batch, result = self.get_batch_fn()
+            if self.get_batch_fn_handler is not None:
+                new_batch = self.get_batch_fn_handler(new_batch)
+            current_batch = RolloutResult.merge_batches([current_batch, new_batch])
+            current_batch_size = current_batch[self.batch_tensor_key].shape[0]
+        return current_batch
+
     def _get_global_batches(self):
         """Split a batch into multiple global batches, each of which will be used for one step of inference/training."""
         batch, result = self.get_batch_fn()
@@ -1039,9 +1005,14 @@ class BatchResizingIterator:
             batch = self.get_batch_fn_handler(batch)
         batch_size = result.num_sequence
         if batch_size % self.global_batch_size != 0:
-            # If the batch size is smaller than the global batch size per data parallel group,
-            # we can return the batch as is
-            return iter([batch])
+            if self.global_batch_handler is not None:
+                # No need to fill global batches if it's already filled by full batches
+                batch = self._fill_global_batches(batch)
+                batch_size = get_batch_size(batch, self.batch_tensor_key)
+            else:
+                # If the batch size is smaller than the global batch size per data parallel group,
+                # we can return the batch as is
+                return iter([batch])
         num_splits = batch_size // self.global_batch_size
         return get_iterator_k_split(
             batch,
@@ -1065,6 +1036,12 @@ class BatchResizingIterator:
                 # If both the current micro and global batch iterators are exhausted, fetch a new batch
                 self.global_batch_iter = self._get_global_batches()
                 global_batch = next(self.global_batch_iter)
+
+            if self.global_batch_handler is not None:
+                global_batch = self.global_batch_handler(global_batch)
+                assert global_batch is not None, (
+                    f"global batch handler {self.global_batch_handler} must not return None."
+                )
 
             global_batch_size = get_batch_size(global_batch, self.batch_tensor_key)
             self.micro_batch_iter = get_iterator_k_split(
