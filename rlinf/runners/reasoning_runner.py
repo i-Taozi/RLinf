@@ -334,7 +334,7 @@ class ReasoningRunner:
                         self._sync_weights()
 
                     if self.scheduler is not None:
-                        scheduler_handle = self.scheduler.run()
+                        scheduler_handle = self.scheduler.schedule()
 
                     # Rollout
                     rollout_handle: Handle = self.rollout.rollout(

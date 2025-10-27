@@ -85,7 +85,7 @@ class SchedulerWorker(Worker):
         )
         self.scheduler_state = get_global_scheduer_state()
 
-    async def run(self):
+    async def schedule(self):
         """Run the scheduler."""
         await self.pre_process()
         await self.main_loop()
