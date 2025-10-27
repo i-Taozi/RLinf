@@ -424,3 +424,7 @@ class AsyncChannelCommWork(AsyncWork):
         with AsyncChannelCommWork.store_lock:
             AsyncChannelCommWork.channel_data_store.pop(self._query_id, None)
         return self._data_future.value()
+
+    def done(self):
+        """Query the completion state of the work."""
+        return self._data_future.done()
