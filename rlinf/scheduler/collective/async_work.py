@@ -361,6 +361,10 @@ class AsyncChannelWork(AsyncWork):
         self._future.wait()
         return self._future.value()
 
+    def done(self):
+        """Query the completion state of the work."""
+        return self._future.done()
+
 
 class AsyncChannelCommWork(AsyncWork):
     """Asynchronous work for channel operations."""
