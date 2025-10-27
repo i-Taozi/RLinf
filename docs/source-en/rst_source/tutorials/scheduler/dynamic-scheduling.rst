@@ -34,15 +34,16 @@ How to Use Dynamic Scheduling
 -----------------------------
 
 Prerequisites
-^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 1) Prepare Megatron-LM online scaling dependency (prebuilt):
 
 .. code-block:: bash
 
-    cd YourWorkspace
+    WORKSPACE=YourWorkspace
+    cd $WORKSPACE
     git clone git@github.com:i-Taozi/params_resharding_release.git
-    export PYTHONPATH=$PYTHONPATH:YourWorkspace/params_resharding_release
+    export PYTHONPATH=$PYTHONPATH:$WORKSPACE/params_resharding_release
 
 This repository provides the compiled artifacts for Megatron-LM online scaling. The source code will be released in future.
 
@@ -50,16 +51,24 @@ This repository provides the compiled artifacts for Megatron-LM online scaling. 
 
 .. code-block:: bash
 
-    cd YourWorkspace
-    git clone git@github.com:NVIDIA/Megatron.git
-    cd Megatron-LM
-    git checkout core_r0.11.0
-    export PYTHONPATH=$PYTHONPATH:YourWorkspace/Megatron-LM
+    WORKSPACE=YourWorkspace
+    cd $WORKSPACE
+    git clone -b core_r0.11.0 git@github.com:NVIDIA/Megatron-LM.git
+    export PYTHONPATH=$PYTHONPATH:$WORKSPACE/Megatron-LM
+
+.. important::
+    If you use `torch >= 2.6.0`, Megatron-LM 0.11 may raise errors due to the default `torch.load` behavior.
+    You can clone a modified Megatron-LM 0.11 version from 
+
+    .. code-block:: bash
+
+        git clone -b core_v0.11.0_rlinf git@github.com:RLinf/Megatron-LM.git
 
 Configuration Example
-^^^^^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Disaggregated Pipeline configuration:
+
 .. code-block:: yaml
 
     cluster:
@@ -70,7 +79,8 @@ Disaggregated Pipeline configuration:
         actor: 6-7
 
 Based on the disaggregated pipeline configuration, change the component order and enable the auto scheduler.
-Make sure the component order is actor -> rollout -> inference, otherwise the actor can't scale up.
+Make sure the component order is `actor -> rollout -> inference`, otherwise the actor can't scale up.
+
 .. code-block:: yaml
 
     cluster:
@@ -93,15 +103,15 @@ and decides whether to adjust resources. Typical actions include:
 - When rollout or inference finishes: release resources to expand the actor
 
 Optional Policies
-^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- use_pre_process_policy
+- `use_pre_process_policy`
 
   1. In the early phase of each iteration, temporarily transfer actor resources to rollout
   2. When the scheduler detects an appropriate time, reassign part of rollout resources back to the actor
   3. Effective for long sequence length (expensive rollout) scenarios to maximize pipeline efficiency
 
-- use_wait_before_last_iter_policy
+- `use_wait_before_last_iter_policy`
 
   1. Before the last actor iter in an iteration, the actor waits for rollout and inference to finish
   2. Then the actor takes all resources for an expanded final step
