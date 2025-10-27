@@ -24,11 +24,9 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.multiprocessing.reductions import reduce_tensor
 
 import rlinf.algorithms  # noqa: F401
-from rlinf.algorithms.registry import actor_loss, calculate_adv_and_returns
+from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
     kl_penalty,
-    preprocess_advantages_inputs,
-    preprocess_loss_inputs,
 )
 from rlinf.data.io_struct import RolloutResult
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import (
@@ -55,6 +53,7 @@ from rlinf.utils.utils import (
     compute_logprobs_from_logits,
     cpu_weight_swap,
     masked_mean,
+    reshape_entropy,
     retrieve_model_state_dict_in_cpu,
     seq_mean_token_mean,
     seq_mean_token_sum,
@@ -404,7 +403,7 @@ class FSDPActor(FSDPModelManager, Worker):
                     )
                     clip_ratio_c = self.cfg.algorithm.get("clip_ratio_c", 3.0)
 
-                    loss, mbs_metrics_data = actor_loss(
+                    loss, mbs_metrics_data = policy_loss(
                         loss_type=self.cfg.algorithm.loss_type,
                         loss_agg_func=self.loss_agg_func,
                         logprobs=logprobs,
@@ -414,6 +413,7 @@ class FSDPActor(FSDPModelManager, Worker):
                         clip_ratio_high=clip_ratio_high,
                         clip_ratio_c=clip_ratio_c,
                         loss_mask=loss_mask,
+                        task_type=self.cfg.runner.task_type,
                     )
 
                     entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
@@ -503,16 +503,28 @@ class FSDPActor(FSDPModelManager, Worker):
         Args:
             batch (Dict[str, torch.Tensor]): The rollout batch.
         """
-
         with self.worker_timer():
-            mask = batch["attention_mask"][:, -self.response_len :]
-            advantages, returns = calculate_adv_and_returns(
-                adv_type=self.cfg.algorithm.adv_type,
-                reward_scores=batch["rewards"].cuda(),
-                mask=mask.cuda(),
-                num_responses=self.cfg.algorithm.group_size,
-            )
-            batch["advantages"] = advantages
+            if batch.get("advantages", None) is None:
+                mask = batch["attention_mask"][:, -self.response_len :]
+                advantages, _ = calculate_adv_and_returns(
+                    task_type=self.cfg.runner.task_type,
+                    adv_type=self.cfg.algorithm.adv_type,
+                    rewards=batch["rewards"].cuda(),
+                    loss_mask=mask.cuda(),
+                    group_size=self.cfg.algorithm.group_size,
+                    kl_beta=self.cfg.algorithm.get("reinpp_kl_beta", 0.0),
+                    kl_penalty_type=self.kl_penalty_type,
+                    logprob=batch["prev_logprobs"].cuda()
+                    if "prev_logprobs" in batch
+                    else None,
+                    ref_logprob=batch["ref_logprobs"].cuda()
+                    if "ref_logprobs" in batch
+                    else None,
+                    use_reinpp_baseline=self.cfg.algorithm.get(
+                        "use_reinpp_baseline", False
+                    ),
+                )
+                batch["advantages"] = advantages
 
         return batch
 
@@ -546,9 +558,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.stage_num = cfg.rollout.pipeline_stage_num
 
         self.channel = self.connect_channel(cfg.actor.channel.name)
-        self.channel.create_queue(
-            cfg.actor.channel.queue_name, maxsize=cfg.actor.channel.queue_size
-        )
 
     def init_worker(self):
         self.setup_model_and_optimizer()
@@ -593,7 +602,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         for _ in range(split_num):
             recv_list.append(
                 await self.channel.get(
-                    queue_name=self._replay_buffer_name, async_op=True
+                    key=self._replay_buffer_name, async_op=True
                 ).async_wait()
             )
 
@@ -704,12 +713,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
 
         kwargs = {
+            "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
             "rewards": self.rollout_batch["rewards"],
             "dones": self.rollout_batch["dones"],
-            "normalize_advantages": self.cfg.algorithm.get(
-                "normalize_advantages", True
-            ),
             "values": self.rollout_batch.get("prev_values", None),
             "gamma": self.cfg.algorithm.get("gamma", 1),
             "gae_lambda": self.cfg.algorithm.get("gae_lambda", 1),
@@ -720,13 +727,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
             "rollout_epoch": self.cfg.algorithm.get("rollout_epoch", 1),
         }
-        kwargs = preprocess_advantages_inputs(**kwargs)
-        advantages, returns = calculate_adv_and_returns(**kwargs)
 
+        advantages_and_returns = calculate_adv_and_returns(**kwargs)
+
+        self.rollout_batch.update(advantages_and_returns)
         self.rollout_batch.update(
             {
-                "advantages": advantages,
-                "returns": returns,
                 "loss_mask": kwargs["loss_mask"],
                 "loss_mask_sum": kwargs["loss_mask_sum"],
             }
@@ -821,13 +827,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         data["top_k"] = self.cfg.algorithm.sampling_params.top_k
 
                     compute_values = (
-                        True if self.cfg.algorithm.adv_type == "embodied_gae" else False
+                        True if self.cfg.algorithm.adv_type == "gae" else False
                     )
 
                     output_dict = self.model(
                         data=data,
                         compute_logprobs=True,
-                        compute_entropy=True,
+                        compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
                         compute_values=compute_values,
                         use_cache=False,
                     )
@@ -839,10 +845,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "loss_type": self.cfg.algorithm.loss_type,
                         "logprob_type": self.cfg.algorithm.logprob_type,
                         "reward_type": self.cfg.algorithm.reward_type,
-                        "entropy_type": self.cfg.algorithm.entropy_type,
                         "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
                         "logprobs": output_dict["logprobs"],
-                        "entropy": output_dict.get("entropy", None),
                         "values": output_dict.get("values", None),
                         "old_logprobs": prev_logprobs,
                         "advantages": advantages,
@@ -852,14 +856,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
                         "value_clip": self.cfg.algorithm.get("value_clip", None),
                         "huber_delta": self.cfg.algorithm.get("huber_delta", None),
-                        "entropy_bonus": self.cfg.algorithm.entropy_bonus,
                         "loss_mask": loss_mask,
                         "loss_mask_sum": loss_mask_sum,
                         "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                        "task_type": self.cfg.runner.task_type,
+                        "critic_warmup": self.optimizer_steps
+                        < self.critic_warmup_steps,
                     }
-                    kwargs = preprocess_loss_inputs(**kwargs)
+                    loss, metrics_data = policy_loss(**kwargs)
 
-                    loss, metrics_data = actor_loss(**kwargs)
+                    entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
+                    if (
+                        self.cfg.algorithm.entropy_bonus > 0
+                        and not kwargs.critic_warmup
+                    ):
+                        entropy = output_dict["entropy"]
+                        entropy = reshape_entropy(
+                            entropy,
+                            entropy_type=self.cfg.algorithm.entropy_type,
+                            action_dim=self.cfg.actor.model.get("action_dim", 7),
+                            batch_size=output_dict["logprobs"].shape[0],
+                        )
+                        entropy_loss = masked_mean(entropy, mask=loss_mask)
+                        loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
+                    metrics_data["entropy_loss"] = entropy_loss.detach().item()
 
                     loss /= self.gradient_accumulation
                     loss.backward()
@@ -869,18 +889,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                 torch.cuda.empty_cache()
 
-                grad_norm = self.model.clip_grad_norm_(
-                    max_norm=self.cfg.actor.optim.clip_grad
-                )
-                self.optimizer.step()
-
-                self.optimizer.zero_grad()
+                grad_norm, lrs = self.optimizer_step()
                 data = {
                     "actor/grad_norm": grad_norm.detach().item(),
-                    "actor/lr": self.optimizer.param_groups[0]["lr"],
+                    "actor/lr": lrs[0],
                 }
-                if self.cfg.algorithm.adv_type == "embodied_gae":
-                    data["critic/lr"] = self.optimizer.param_groups[1]["lr"]
+                if len(lrs) > 1:
+                    data["critic/lr"] = lrs[1]
                 append_to_dict(metrics, data)
 
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}

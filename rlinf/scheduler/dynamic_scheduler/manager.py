@@ -104,8 +104,6 @@ class ComponentManager(ABC):
             channel = self.channel_factory(
                 get_scheduler_channel(self.component_role, instance_id)
             )
-            channel.create_queue(self.request_queue)
-            channel.create_queue(self.response_queue)
             self.channels.append(channel)
 
     def reset(self):
@@ -340,7 +338,7 @@ class RolloutManager(ComponentManager):
                 self.channels[rollout_instance_id]
                 .put(
                     request,
-                    queue_name=self.request_queue,
+                    key=self.request_queue,
                     async_op=True,
                 )
                 .async_wait()
@@ -362,7 +360,7 @@ class RolloutManager(ComponentManager):
             asyncio.create_task(
                 self.channels[rollout_instance_id]
                 .get(
-                    queue_name=self.response_queue,
+                    key=self.response_queue,
                     async_op=True,
                 )
                 .async_wait()
@@ -738,7 +736,7 @@ class InferenceManager(ComponentManager):
         Initialize the main loop finished handler.
         """
         self.main_loop_finished_handler = self.channels[0].get(
-            queue_name=self.response_queue, async_op=True
+            key=self.response_queue, async_op=True
         )
 
     async def main_loop_finalize(self):
@@ -827,7 +825,7 @@ class ActorManager(ComponentManager):
             return
         await (
             self.channels[0]
-            .put(None, queue_name=self.request_queue, async_op=True)
+            .put(None, key=self.request_queue, async_op=True)
             .async_wait()
         )
 
@@ -874,7 +872,7 @@ class ActorManager(ComponentManager):
             self.channels[0]
             .put(
                 scale_info,
-                queue_name=self.request_queue,
+                key=self.request_queue,
                 async_op=True,
             )
             .async_wait()
@@ -923,11 +921,7 @@ class ActorManager(ComponentManager):
 
     async def wait_for_actor_update(self):
         """Wait for the actor update."""
-        await (
-            self.channels[0]
-            .get(queue_name=self.response_queue, async_op=True)
-            .async_wait()
-        )
+        await self.channels[0].get(key=self.response_queue, async_op=True).async_wait()
 
     async def release_resource(self, *args, **kwargs) -> int:
         """Release the GPU resources.
@@ -996,7 +990,7 @@ class RolloutScalingScheduler:
         scheduler_response = RolloutScheduleInfo(instance_id=self._rank, report=report)
         await self.scheduler_channel.put(
             scheduler_response,
-            queue_name=self.scheduler_response_queue,
+            key=self.scheduler_response_queue,
             async_op=True,
         ).async_wait()
 
@@ -1011,7 +1005,7 @@ class RolloutScalingScheduler:
         )
         await self.scheduler_channel.put(
             scheduler_response,
-            queue_name=self.scheduler_response_queue,
+            key=self.scheduler_response_queue,
             async_op=True,
         ).async_wait()
 
@@ -1044,7 +1038,7 @@ class RolloutScalingScheduler:
         )
         await self.scheduler_channel.put(
             scheduler_response,
-            queue_name=self.scheduler_response_queue,
+            key=self.scheduler_response_queue,
             async_op=True,
         ).async_wait()
 
@@ -1059,7 +1053,7 @@ class RolloutScalingScheduler:
         """
         while True:
             request: RolloutScheduleInfo = await self.scheduler_channel.get(
-                queue_name=self.scheduler_request_queue, async_op=True
+                key=self.scheduler_request_queue, async_op=True
             ).async_wait()
 
             match request.action:
