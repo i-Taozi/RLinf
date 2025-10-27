@@ -852,12 +852,12 @@ class MegatronActor(MegatronModelManager, Worker):
         if self._rank == 0:
             if send_request_first:
                 self.schedule_channel.put(
-                    None, queue_name=self.scheduler_response_queue, async_op=True
-                ).wait()
+                    None, queue_name=self.scheduler_response_queue
+                )
 
             response = self.schedule_channel.get(
-                queue_name=self.scheduler_request_queue, async_op=True
-            ).wait()
+                queue_name=self.scheduler_request_queue
+            )
         else:
             response = None
         return self.broadcast_obj(response)

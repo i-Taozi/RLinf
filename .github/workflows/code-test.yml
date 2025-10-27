@@ -150,7 +150,6 @@ jobs:
           source switch_env reason
           bash tests/e2e_tests/reasoning/run.sh qwen2.5-1.5b-grpo-collocated-fsdp-vllm
 
-
   reason-qwen-grpo-test-rollout-logprobs:
     needs: [check-changes]
     if: needs.check-changes.outputs.file_filter == 'true'
@@ -391,6 +390,7 @@ jobs:
       # Reason e2e tests
       reason-qwen-grpo-test,
       reason-qwen-grpo-test-rollout-logprobs,
+      reason-qwen-grpo-dynamic-scheduler-test,
       coding-online-rl-qwen-ppo-test,
       qwen-vl-grpo-test,
 

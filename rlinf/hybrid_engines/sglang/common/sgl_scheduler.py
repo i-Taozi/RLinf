@@ -17,7 +17,6 @@ import logging
 import torch
 from omegaconf import DictConfig
 from sglang.srt.managers.io_struct import (
-    AbortReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
 )
@@ -131,25 +130,6 @@ class Scheduler(_Scheduler):
         if "async_op" in obj.kwargs and obj.kwargs["async_op"]:
             result = result.wait()
         return TaskMethodOutput(method_name=obj.method_name, result=result)
-
-    def abort_request(self, recv_req: AbortReq):
-        # Compared to the original SGLang implementation, we will remove all requests that start with the given rid.
-        # Delete requests in the waiting queue
-        to_del = []
-        for i, req in enumerate(self.waiting_queue):
-            if req.rid.startswith(recv_req.rid):
-                to_del.append(i)
-
-        # Sort in reverse order to avoid index issues when deleting
-        for i in sorted(to_del, reverse=True):
-            req = self.waiting_queue.pop(i)
-            logger.debug(f"Abort queued request. {req.rid=}")
-
-        # Delete requests in the running batch
-        for req in self.running_batch.reqs:
-            if req.rid.startswith(recv_req.rid) and not req.finished():
-                logger.debug(f"Abort running request. {req.rid=}")
-                req.to_abort = True
 
     def abort_generation(self, recv_req: AbortGenerationInput):
         # clear waiting reqs
