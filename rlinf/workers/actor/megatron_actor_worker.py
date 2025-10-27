@@ -861,13 +861,9 @@ class MegatronActor(MegatronModelManager, Worker):
     def get_scheduler_response(self, send_request_first: bool):
         if self._rank == 0:
             if send_request_first:
-                self.schedule_channel.put(
-                    None, queue_name=self.scheduler_response_queue
-                )
+                self.schedule_channel.put(None, key=self.scheduler_response_queue)
 
-            response = self.schedule_channel.get(
-                queue_name=self.scheduler_request_queue
-            )
+            response = self.schedule_channel.get(key=self.scheduler_request_queue)
         else:
             response = None
         return self.broadcast_obj(response)
@@ -897,9 +893,7 @@ class MegatronActor(MegatronModelManager, Worker):
         self.broadcast(None, ranks=list(range(inference_world_size)))
         self.is_weight_offloaded = True
         if self._rank == 0:
-            self.schedule_channel.put(
-                None, queue_name=self.scheduler_response_queue, async_op=True
-            ).wait()
+            self.schedule_channel.put(None, key=self.scheduler_response_queue)
 
     def get_rollout_metrics_group(self, batch):
         if not self.use_auto_scheduler:
