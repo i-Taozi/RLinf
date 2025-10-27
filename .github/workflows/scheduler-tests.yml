@@ -19,8 +19,6 @@ jobs:
           bash tests/e2e_tests/auto_placement/run.sh
 
   dynamic-scheduler-reason-qwen-grpo-test:
-    needs: [check-changes]
-    if: needs.check-changes.outputs.file_filter == 'true'
     runs-on: reason
     steps:
       - name: Checkout code
