@@ -14,7 +14,7 @@
 
 import copy
 from functools import partial
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 import torch.distributed
@@ -87,7 +87,11 @@ from rlinf.utils.utils import (
 from rlinf.workers.rollout.utils import RankMapper
 
 try:
-    from params_resharding import nccl_group_recreate, resharding_init
+    from params_resharding import (
+        ElasticMegatronManager,
+        apply_hetero_dp,
+        nccl_group_recreate,
+    )
 
     HAVE_RESHARDING = True
 except ImportError:
@@ -658,10 +662,21 @@ class MegatronActor(MegatronModelManager, Worker):
             train_metrics = self.run_forward_backward_iterator(batch)
         else:
             train_metrics = self.run_forward_backward(batch, forward_only=False)
+
         increment = (
             get_num_microbatches()
             * self.cfg.actor.micro_batch_size
             * parallel_state.get_data_parallel_world_size()
+        )
+
+        # hetero-dp: use global_batch_size as increment
+        new_increment = self.cfg.actor.global_batch_size
+        assert new_increment == increment, (
+            f"new_increment={new_increment} != increment={increment}"
+        )
+
+        self.log_info(
+            f"get_num_microbatches()={get_num_microbatches()}, increment={increment}"
         )
         success, grad_norm, num_zeros_in_grad, lr = self.optimizer_step(increment)
 
@@ -903,7 +918,7 @@ class MegatronActor(MegatronModelManager, Worker):
         else:
             trained_batch_size = get_batch_size(batch)
 
-        max_data_parallel_group = parallel_state.get_data_parallel_group_elastic_max()
+        max_data_parallel_group = self.get_elastic_data_parallel_group()
         max_data_parallel_ranks = torch.distributed.get_process_group_ranks(
             max_data_parallel_group
         )
@@ -942,6 +957,13 @@ class MegatronActor(MegatronModelManager, Worker):
             gbs=self.cfg.actor.global_batch_size,
             dp=parallel_state.get_data_parallel_world_size(),
         )
+
+        # hetero-dp : global_batch_size may changed.
+        # from megatron.core.num_microbatches_calculator import get_current_global_batch_size
+        # global_batch_size = get_current_global_batch_size()
+        # data_parallel_world_size = parallel_state.get_data_parallel_world_size()
+        # self.total_batch_size_per_dp = global_batch_size * self.num_train_steps // data_parallel_world_size
+
         self.total_batch_size_per_dp = (
             self.cfg.data.rollout_batch_size
             * self.cfg.algorithm.group_size
@@ -984,6 +1006,7 @@ class MegatronActor(MegatronModelManager, Worker):
             * args.context_parallel_size
         )
 
+        self._max_world_size = args.world_size
         assert args.world_size == self.component_placement._cluster_num_gpus, (
             "In Auto-Scheduler mode, actor should be initialized on all GPUs."
         )
@@ -993,6 +1016,7 @@ class MegatronActor(MegatronModelManager, Worker):
             self.cfg,
             self.component_placement._cluster_num_gpus,
             default_model_parallel_size_with_cp,
+            with_hetero_dp=True,
         )
         assert len(valid_dp_sizes) > 0
         resharding_strategies = []
@@ -1000,6 +1024,9 @@ class MegatronActor(MegatronModelManager, Worker):
         for valid_dp_size in reversed(valid_dp_sizes):
             world_size = default_model_parallel_size_with_cp * valid_dp_size
             assert world_size <= self.component_placement._cluster_num_gpus
+
+            if world_size < self.component_placement.actor_world_size:
+                break
 
             resharding_strategies.append(
                 {
@@ -1012,14 +1039,12 @@ class MegatronActor(MegatronModelManager, Worker):
 
         assert resharding_strategies[0]["world_size"] == args.world_size
 
-        self.trainer_resharding_func: Callable = resharding_init(
+        self.elastic_megatron_manager = ElasticMegatronManager(
             model=self.model,
             optimizer=self.optimizer,
             opt_param_scheduler=self.lr_scheduler,
-            trainer_parallel_strategies=resharding_strategies,
-            offload_frist_strategy=False,
             model_provider=self.model_provider_func,
-            _logger=self._logger,
+            parallel_strategy_list=resharding_strategies,
         )
 
         if first_world_size == -1:
@@ -1028,12 +1053,83 @@ class MegatronActor(MegatronModelManager, Worker):
         self.is_running = True
         self.apply_parallel_strategy({"world_size": first_world_size})
 
-    def apply_parallel_strategy(self, parallel_strategy):
-        """Apply specified training parallel strategy"""
+        # Note. This may affect early stopping.
+        apply_hetero_dp(
+            self._process_fwd_bwd_outputs_for_hetero_dp,
+            alignment=self.cfg.algorithm.group_size,
+        )
 
-        args = get_args()
-        args.load = None
+    def _pad_forward_backward_outputs_for_hetero_dp(
+        self, forward_backward_outputs: list, max_forward_backward_outputs_len: int
+    ) -> list:
+        """Pad forward_backward_outputs to max length."""
+        forward_backward_outputs_len = len(forward_backward_outputs)
+        if forward_backward_outputs_len == max_forward_backward_outputs_len:
+            return forward_backward_outputs
 
+        default_item = {}
+        for k, v in forward_backward_outputs[0].items():
+            if isinstance(v, torch.Tensor):
+                default_item[k] = torch.tensor(0, dtype=v.dtype, device=v.device)
+            else:
+                assert isinstance(v, (int, float)), (
+                    f"v={v} is not a tensor or int or float"
+                )
+                default_item[k] = type(v)(0)
+
+        forward_backward_outputs += [
+            copy.deepcopy(default_item)
+            for _ in range(
+                max_forward_backward_outputs_len - forward_backward_outputs_len
+            )
+        ]
+
+        return forward_backward_outputs
+
+    def _process_fwd_bwd_outputs_for_hetero_dp(
+        self, forward_backward_outputs: list
+    ) -> list:
+        """Execute data-parallel-group sync after foward_backward_func is done if hetero-dp is applied.
+
+        If hetero-dp is applied, the data-parallel-group sync will be disabled during forward_step().
+        So we need to execute data-parallel-group sync after foward_backward_func is done.
+
+        Note. This may affect early stopping.
+        """
+        assert isinstance(forward_backward_outputs, list), (
+            f"forward_backward_func should return a list, but got {type(forward_backward_outputs)}"
+        )
+        assert len(forward_backward_outputs) > 0, (
+            f"forward_backward_func should return a non-empty list, but got {len(forward_backward_outputs)}"
+        )
+
+        max_forward_backward_outputs_len = torch.tensor(
+            len(forward_backward_outputs), dtype=torch.int
+        ).cuda()
+        torch.distributed.all_reduce(
+            max_forward_backward_outputs_len,
+            group=parallel_state.get_data_parallel_group(),
+            op=torch.distributed.ReduceOp.MAX,
+        )
+
+        padded_forward_backward_outputs = (
+            self._pad_forward_backward_outputs_for_hetero_dp(
+                forward_backward_outputs, max_forward_backward_outputs_len
+            )
+        )
+
+        for forward_backward_output in padded_forward_backward_outputs:
+            for k, v in forward_backward_output.items():
+                if v is not None:
+                    forward_backward_output[k] = (
+                        average_losses_across_data_parallel_group([v])
+                    )
+
+        return forward_backward_outputs
+
+    def get_parallel_strategy(
+        self, parallel_strategy: dict[str, int]
+    ) -> dict[str, int]:
         parallel_keys = [
             "world_size",
             "tensor_model_parallel_size",
@@ -1041,7 +1137,7 @@ class MegatronActor(MegatronModelManager, Worker):
             "context_parallel_size",
         ]
         assert parallel_strategy.get("world_size") is not None, (
-            "Error : can't find world_size in parallel_strategy"
+            "can't find world_size in parallel_strategy"
         )
         if parallel_strategy.get("context_parallel_size") is not None:
             assert (
@@ -1058,11 +1154,21 @@ class MegatronActor(MegatronModelManager, Worker):
                     parallel_key
                 ]
 
+        return new_parallel_strategy
+
+    def apply_parallel_strategy(self, parallel_strategy):
+        """Apply specified training parallel strategy"""
+        args = get_args()
+        args.load = None
+
+        new_parallel_strategy = self.get_parallel_strategy(parallel_strategy)
+
         if self._rank == 0:
             self.log_info(
                 f"[ElasticMegatron-Info] start resharing with new_parallel_strategy = {new_parallel_strategy}"
             )
-        training_states, _ = self.trainer_resharding_func(
+
+        training_states = self.elastic_megatron_manager.reshard(
             new_parallel_strategy=new_parallel_strategy
         )
 
@@ -1074,8 +1180,14 @@ class MegatronActor(MegatronModelManager, Worker):
         else:
             self.is_running = False
 
+    def get_elastic_data_parallel_group(self):
+        parallel_strategy = self.get_parallel_strategy(
+            {"world_size": self._max_world_size}
+        )
+        return self.elastic_megatron_manager.get_data_parallel_group(parallel_strategy)
+
     def broadcast_obj(self, obj):
-        parallel_state.global_barrier_by_gloo()
+        self.elastic_megatron_manager.global_barrier_by_gloo()
         device = torch.cuda.current_device()
 
         if self._rank == 0:

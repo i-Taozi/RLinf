@@ -23,8 +23,39 @@ if TYPE_CHECKING:
     from rlinf.scheduler.dynamic_scheduler.manager import ComponentManager
 
 
-def get_valid_dp_sizes(cfg, total_gpus, model_parallel_size_with_cp) -> list[int]:
+def get_valid_dp_sizes_with_hetero_dp(
+    max_dp_size: int,
+    global_batch_size: int,
+    micro_batch_size: int = 1,
+    alignment: int = 1,
+) -> list[int]:
+    """Get the valid data parallel sizes for the Actor based on the constraints of batch and group size when hetero-dp is applied."""
+    all_dp_size_list = list(range(1, max_dp_size + 1))
+
+    assert global_batch_size % (micro_batch_size * alignment) == 0
+    num_microbatches_with_alignment_sum = (
+        global_batch_size // micro_batch_size // alignment
+    )
+
+    valid_dp_sizes = [
+        dp_size
+        for dp_size in all_dp_size_list
+        if num_microbatches_with_alignment_sum >= dp_size
+    ]
+
+    return valid_dp_sizes
+
+
+def get_valid_dp_sizes(
+    cfg, total_gpus: int, model_parallel_size_with_cp: int, with_hetero_dp: bool = False
+) -> list[int]:
     """This function is used to get the valid data parallel sizes for the Actor based on the constraints of batch and group size.
+
+    Args:
+        cfg: The configuration object.
+        total_gpus: The total number of GPUs.
+        model_parallel_size_with_cp: The model parallel size with context parallel.
+        with_hetero_dp: Whether to use hetero-dp.
 
     Returns:
         List[int]: The valid data parallel sizes for the component.
@@ -38,10 +69,16 @@ def get_valid_dp_sizes(cfg, total_gpus, model_parallel_size_with_cp) -> list[int
         f"global_step_batch_size={global_step_batch_size} must be divisible by train_iter={n_minibatches}"
     )
     trainer_iter_batch_size = global_step_batch_size // n_minibatches
+    max_dp_size = total_gpus // model_parallel_size_with_cp
+
+    if with_hetero_dp:
+        return get_valid_dp_sizes_with_hetero_dp(
+            max_dp_size=max_dp_size,
+            global_batch_size=global_step_batch_size,
+            alignment=group_size,
+        )
 
     valid_dp_sizes = []
-
-    max_dp_size = total_gpus // model_parallel_size_with_cp
 
     for dp_size in range(1, max_dp_size + 1):
         if trainer_iter_batch_size % (dp_size * group_size) == 0:
@@ -120,7 +157,10 @@ class _DynamicSchedulerState:
             self.components_model_parallel_size[component] = manager.model_parallel_size
 
         self.actor_valid_dp_sizes: list[int] = get_valid_dp_sizes(
-            cfg, total_gpus, self.components_model_parallel_size["actor"]
+            cfg,
+            total_gpus,
+            self.components_model_parallel_size["actor"],
+            with_hetero_dp=True,
         )
 
     def reset(self):
