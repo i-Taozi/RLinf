@@ -226,7 +226,7 @@ class DisaggregatedScheduleResult(ScheduleResult):
         pipeline_placement = {**source_placement}
         offset = self.source_res.total_gpu_num
         for node, gpu_range in sink_placement.items():
-            gpu_num = len(gpu_range)
-            pipeline_placement[node] = range(gpu_range[0] + offset, gpu_num + offset)
-            offset += gpu_num
+            pipeline_placement[node] = range(
+                gpu_range[0] + offset, gpu_range[-1] + 1 + offset
+            )
         return pipeline_placement

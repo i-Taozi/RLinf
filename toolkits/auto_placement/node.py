@@ -70,11 +70,6 @@ class MegatronNode(ComponentNode):
         super().__init__(role)
 
     def _init_profile_data(self):
-        self._hyper_params = {
-            "max_scale": 8,
-            "bias": 0.5,
-        }
-
         for gpu_num in range(1, self.max_world_size):
             if not self._validate_gpu_num(gpu_num):
                 continue
@@ -90,16 +85,13 @@ class MegatronNode(ComponentNode):
 
         1. estimated_cost_linear = self.collocated_cost_per_group_batch * scale
 
-        2. scale_ratio = math.log(min(scale, max_scale), 2) + bias.
+        2. scale_ratio = 1 + scale/10
 
         3. estimated_cost = estimated_cost_linear / scale_ratio
         """
         scale = self.max_world_size / gpu_num
         estimated_cost_linear = self.collocated_cost_per_group_batch * scale
-        scale_ratio = (
-            math.log(min(scale, self._hyper_params["max_scale"]), 2)
-            + self._hyper_params["bias"]
-        )
+        scale_ratio = 1 + min(0.9, max(scale / 10, 0.1))
         estimated_cost = estimated_cost_linear / scale_ratio
         return estimated_cost
 
