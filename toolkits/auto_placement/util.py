@@ -14,8 +14,6 @@
 
 from argparse import Namespace
 
-# from omegaconf import DictConfig
-
 _GLOBAL_CONFIG = None
 
 

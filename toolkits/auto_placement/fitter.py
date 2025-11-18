@@ -129,13 +129,11 @@ class DataFitter:
         except:  # noqa: E722
             pass
 
-        if fit_results:
-            self.best_fit_type = max(
-                fit_results.keys(), key=lambda x: fit_results[x]["r_squared"]
-            )
-            self.fit_params = fit_results[self.best_fit_type]
-        else:
-            raise ValueError("无法对数据进行拟合")
+        assert fit_results is not None
+        self.best_fit_type = max(
+            fit_results.keys(), key=lambda x: fit_results[x]["r_squared"]
+        )
+        self.fit_params = fit_results[self.best_fit_type]
 
     def _calculate_r_squared(self, y_true, y_pred):
         ss_res = np.sum((y_true - y_pred) ** 2)
