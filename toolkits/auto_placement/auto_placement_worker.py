@@ -168,11 +168,13 @@ def get_workflow_graph(cfg) -> dict[str, list[str]]:
                 "rollout": ["actor"],
                 "actor": [],
             }
-    else:
+    elif cfg.runner.task_type == "embodiment":
         return {
             "env": ["env_rollout"],
             "env_rollout": [],
         }
+    else:
+        raise ValueError(f"{cfg.runner.task_type=} is not supported")
 
 
 @hydra.main(version_base="1.1")
