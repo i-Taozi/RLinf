@@ -16,6 +16,7 @@ import math
 from abc import ABC, abstractmethod
 from typing import Optional
 
+from fitter import DataFitter
 from util import get_global_config
 
 
@@ -133,14 +134,75 @@ class RolloutNode(ComponentNode):
                 )
 
 
+class EnvProfiler:
+    def __init__(
+        self,
+        env_profile_data: dict[int, float],
+        env_rollout_ratio: float,
+        total_env_num: int,
+    ):
+        self.data_fitter = DataFitter(env_profile_data)
+        self.total_env_num = total_env_num
+        self.env_rollout_ratio = env_rollout_ratio
+
+        self.max_env_num_per_gpu = max(env_profile_data.keys())
+
+    def _get_env_cost_by_single_gpu(self, env_num_per_gpu: int) -> float:
+        return self.data_fitter.get_value(env_num_per_gpu)
+
+    def get_env_cost(self, env_gpu_num: int) -> Optional[float]:
+        if self.total_env_num % env_gpu_num != 0:
+            return None
+        if self.total_env_num // env_gpu_num > self.max_env_num_per_gpu:
+            return None
+        return self._get_env_cost_by_single_gpu(self.total_env_num // env_gpu_num)
+
+    def get_rollout_cost(self, rollout_instance_num: int) -> float:
+        env_num_per_rollout_instance = self.total_env_num // rollout_instance_num
+        return (
+            self._get_env_cost_by_single_gpu(env_num_per_rollout_instance)
+            / self.env_rollout_ratio
+        )
+
+
 class EnvNode(ComponentNode):
-    def __init__(self):
+    def __init__(self, profiler: EnvProfiler):
         self.role = "env"
+        self.profiler = profiler
+        self._gpu_num_to_cost: dict[int, float] = {}
+        self._init_profile_data()
 
-    def _init_profile_data(self): ...
+    def _init_profile_data(self):
+        config = get_global_config()
+        self._gpu_num_to_cost: dict[int, float] = {}
+        for gpu_num in range(1, config.total_gpus + 1):
+            self._gpu_num_to_cost[gpu_num] = self.profiler.get_env_cost(gpu_num)
 
-    def profile(self, gpu_num: int) -> Optional[float]:
-        raise NotImplementedError("EnvNode is not implemented")
+
+class EnvRolloutNode(ComponentNode):
+    """Rollout Node in embodiment task."""
+
+    def __init__(
+        self,
+        profiler: EnvProfiler,
+        model_parallel_size: int,
+    ):
+        self.role = "env_rollout"
+        self.profiler = profiler
+        self.model_parallel_size = model_parallel_size
+
+        self._gpu_num_to_cost: dict[int, float] = {}
+        self._init_profile_data()
+
+    def _init_profile_data(self):
+        config = get_global_config()
+
+        for gpu_num in range(1, config.total_gpus + 1):
+            if gpu_num % self.model_parallel_size != 0:
+                continue
+            self._gpu_num_to_cost[gpu_num] = self.profiler.get_rollout_cost(
+                gpu_num // self.model_parallel_size
+            )
 
 
 class SccNode(ComponentNode):

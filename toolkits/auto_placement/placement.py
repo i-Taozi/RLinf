@@ -124,15 +124,21 @@ class SingleNodeScheduleResult(ScheduleResult):
     """ScheduleResult for single ComponentNode."""
 
     def __init__(
-        self, total_gpu_num: int, node: ComponentNode, cost_per_group_batch: float
+        self,
+        total_gpu_num: int,
+        node: ComponentNode,
+        cost_per_group_batch: float,
+        total_cost: Optional[float] = None,
     ):
         config = get_global_config()
+        if total_cost is None:
+            total_cost = cost_per_group_batch * config.rollout_batch_size
         super().__init__(
             mode=ScheduleMode.SINGLE_NODE,
             total_gpu_num=total_gpu_num,
             placement={node: range(total_gpu_num)},
             cost_per_group_batch=cost_per_group_batch,
-            total_cost=cost_per_group_batch * config.rollout_batch_size,
+            total_cost=total_cost,
         )
 
 

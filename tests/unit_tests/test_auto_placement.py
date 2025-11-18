@@ -24,7 +24,7 @@ sys.path.insert(
 )
 # Add RLinf to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-from node import ComponentNode, EnvNode, MegatronNode, RolloutNode, SccNode
+from node import ComponentNode, MegatronNode, RolloutNode, SccNode
 from placement import ScheduleMode, ScheduleResult
 from util import init_global_config
 from workflow import Workflow, traverse_st_cuts
@@ -45,7 +45,7 @@ except ImportError as e:
     pytestmark = pytest.mark.skip(f"Auto placement modules not available: {e}")
 
 
-def get_mock_config():
+def get_mock_config_reasoning():
     mock_cfg = MagicMock()
     mock_cfg.runner.task_type = "reasoning"
 
@@ -85,7 +85,39 @@ def get_mock_config():
     return mock_cfg, mock_component_placement
 
 
-mock_cfg, mock_component_placement = get_mock_config()
+def get_mock_config_embodiment():
+    mock_cfg = MagicMock()
+    mock_cfg.runner.task_type = "embodiment"
+
+    mock_cfg.data.env_num = 16 * 8 * 3
+    mock_cfg.data.rollout_batch_size = 1024
+
+    mock_cfg.profile_data.env_profile_data = {
+        4: 0.27,
+        8: 0.42,
+        16: 0.76,
+        32: 1.37,
+        64: 2.4,
+    }
+    mock_cfg.profile_data.env_rollout_ratio = 1 / 3
+
+    # Model size
+    mock_component_placement = MagicMock()
+    mock_component_placement._cluster_num_gpus = 4 * 8
+    mock_component_placement._components = [
+        "env",
+        "rollout",
+    ]
+    mock_component_placement.rollout_dp_size = (
+        mock_component_placement._cluster_num_gpus
+    )
+    mock_component_placement.rollout_world_size = (
+        mock_component_placement._cluster_num_gpus
+    )
+    return mock_cfg, mock_component_placement
+
+
+mock_cfg, mock_component_placement = get_mock_config_reasoning()
 init_global_config(mock_cfg, mock_component_placement)
 
 
@@ -121,7 +153,6 @@ class TestWorkflow:
         "rollout": RolloutNode(),
         "inference": MegatronNode("inference"),
         "actor": MegatronNode("actor"),
-        "env": EnvNode(),
     }
 
     def get_node(self, name: str) -> ComponentNode:
@@ -192,8 +223,11 @@ class TestWorkflow:
     def test_compress_sccs(self):
         """Test SCC compression."""
         graph = {
-            self.get_node("env"): [self.get_node("rollout")],
-            self.get_node("rollout"): [self.get_node("env"), self.get_node("actor")],
+            self.get_node("inference"): [self.get_node("rollout")],
+            self.get_node("rollout"): [
+                self.get_node("inference"),
+                self.get_node("actor"),
+            ],
             self.get_node("actor"): [],
         }
         workflow = Workflow(graph)
@@ -203,19 +237,22 @@ class TestWorkflow:
 
         topological_order = compressed_workflow.topological_order
         assert isinstance(topological_order[0], SccNode)
-        assert topological_order[0].role in ["env - rollout", "rollout - env"]
+        assert topological_order[0].role in [
+            "inference - rollout",
+            "rollout - inference",
+        ]
 
 
 @pytest.mark.skipif(
     not IMPORTS_AVAILABLE, reason="Auto placement modules not available"
 )
-class TestAutoPlacementWorker:
+class TestAutoPlacementWorkerForReasoning:
     """Tests for the SchedulerTask class."""
 
     def test_auto_placement_worker(self):
         """Test SchedulerTask initialization."""
         # Create a mock config
-        mock_cfg, mock_component_placement = get_mock_config()
+        mock_cfg, mock_component_placement = get_mock_config_reasoning()
 
         graph = {
             "rollout": ["inference"],
@@ -235,6 +272,93 @@ class TestAutoPlacementWorker:
             f"{res}"
         )
         assert len(res.placement[auto_placement_worker.get_node("actor")]) == 32
+
+
+@pytest.mark.skipif(
+    not IMPORTS_AVAILABLE, reason="Auto placement modules not available"
+)
+class TestAutoPlacementWorkerForEmbodiment:
+    """Tests for the SchedulerTask class."""
+
+    def test_disaggregated(self):
+        """Test SchedulerTask initialization."""
+        # Create a mock config
+        mock_cfg, mock_component_placement = get_mock_config_embodiment()
+
+        graph = {
+            "env": ["env_rollout"],
+            "env_rollout": [],
+        }
+
+        def test_env_rollout_ratio(env_rollout_ratio):
+            mock_cfg.profile_data.env_rollout_ratio = env_rollout_ratio
+            auto_placement_worker = AutoPlacementWorker(
+                mock_cfg, mock_component_placement, graph
+            )
+            res = auto_placement_worker.run()
+            assert isinstance(res, ScheduleResult)
+            assert res.total_gpu_num == mock_component_placement._cluster_num_gpus
+            assert res.mode == ScheduleMode.DISAGGREGATED
+
+            rollout_gpu_num = len(
+                res.placement[auto_placement_worker.get_node("env_rollout")]
+            )
+            env_gpu_num = len(res.placement[auto_placement_worker.get_node("env")])
+            assert (
+                rollout_gpu_num + env_gpu_num
+                == mock_component_placement._cluster_num_gpus
+            )
+
+            assert env_gpu_num / rollout_gpu_num == env_rollout_ratio
+
+        test_env_rollout_ratio(1 / 3)
+        test_env_rollout_ratio(3 / 1)
+
+    def get_collocated_mock_config(self):
+        mock_cfg = MagicMock()
+        mock_cfg.runner.task_type = "embodiment"
+
+        mock_cfg.data.env_num = 64 * 2
+        mock_cfg.data.rollout_batch_size = 1024
+
+        mock_cfg.profile_data.env_profile_data = {
+            4: 0.27,
+            8: 0.42,
+            16: 0.76,
+            32: 1.37,
+            64: 2.4,
+        }
+        mock_cfg.profile_data.env_rollout_ratio = 2 / 1
+
+        # Model size
+        mock_component_placement = MagicMock()
+        mock_component_placement._cluster_num_gpus = 1 * 8
+        mock_component_placement._components = [
+            "env",
+            "rollout",
+        ]
+        mock_component_placement.rollout_dp_size = (
+            mock_component_placement._cluster_num_gpus
+        )
+        mock_component_placement.rollout_world_size = (
+            mock_component_placement._cluster_num_gpus
+        )
+
+        return mock_cfg, mock_component_placement
+
+    def test_collocated(self):
+        mock_cfg, mock_component_placement = self.get_collocated_mock_config()
+
+        graph = {
+            "env": ["env_rollout"],
+            "env_rollout": [],
+        }
+        auto_placement_worker = AutoPlacementWorker(
+            mock_cfg, mock_component_placement, graph
+        )
+        res = auto_placement_worker.run()
+        assert res.total_gpu_num == mock_component_placement._cluster_num_gpus
+        assert res.mode == ScheduleMode.COLLOCATED
 
 
 if __name__ == "__main__":
