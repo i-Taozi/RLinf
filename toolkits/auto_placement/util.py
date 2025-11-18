@@ -20,6 +20,13 @@ _GLOBAL_CONFIG = None
 
 
 def init_global_config(config, component_placement):
+    if config.runner.task_type == "reasoning":
+        init_global_config_reasoning(config, component_placement)
+    else:
+        init_global_config_env(config, component_placement)
+
+
+def init_global_config_reasoning(config, component_placement):
     global _GLOBAL_CONFIG
 
     _GLOBAL_CONFIG = Namespace(
@@ -57,6 +64,28 @@ def init_global_config(config, component_placement):
             max_world_size=world_size,
             collocated_cost_total=getattr(config.profile_data, "inference_cost"),
         )
+
+
+def init_global_config_env(config, component_placement):
+    global _GLOBAL_CONFIG
+
+    _GLOBAL_CONFIG = Namespace(
+        task_type=config.runner.task_type,
+        total_gpus=component_placement._cluster_num_gpus,
+        env_num=config.data.env_num,
+        rollout_batch_size=config.data.rollout_batch_size,
+        profile_data=config.profile_data,
+        components_config={},
+    )
+
+    assert "rollout" in component_placement._components
+    rollout_instance_num = component_placement.rollout_dp_size
+    rollout_world_size = component_placement.rollout_world_size
+    rollout_model_parallel_size = rollout_world_size // rollout_instance_num
+    _GLOBAL_CONFIG.components_config["env_rollout"] = Namespace(
+        model_parallel_size=rollout_model_parallel_size,
+        max_world_size=rollout_world_size,
+    )
 
 
 def get_global_config():

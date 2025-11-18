@@ -15,7 +15,14 @@
 from typing import Optional
 
 import hydra
-from node import ComponentNode, MegatronNode, RolloutNode
+from node import (
+    ComponentNode,
+    EnvNode,
+    EnvProfiler,
+    EnvRolloutNode,
+    MegatronNode,
+    RolloutNode,
+)
 from placement import (
     ScheduleMode,
     ScheduleResult,
@@ -24,7 +31,6 @@ from placement import (
 from util import get_global_config, get_valid_gpu_num_list, init_global_config
 from workflow import Workflow, traverse_st_cuts
 
-# from rlinf.config import validate_cfg
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import ModelParallelComponentPlacement
 
@@ -36,9 +42,6 @@ class AutoPlacementWorker:
         component_placement,
         graph: Optional[dict[str, list[str]]] = None,
     ):
-        assert cfg.runner.task_type == "reasoning", (
-            f"Only reasoning task is supported, current task type: {cfg.runner.task_type}"
-        )
         init_global_config(cfg, component_placement)
         self.config = get_global_config()
         self.components_config = self.config.components_config
@@ -46,17 +49,32 @@ class AutoPlacementWorker:
         self._init_workflow(graph)
 
     def get_node(self, component_name: str) -> ComponentNode:
+        if self.config.task_type != "reasoning":
+            if not hasattr(self, "env_profiler"):
+                self.env_profiler = EnvProfiler(
+                    self.config.profile_data.env_profile_data,
+                    self.config.profile_data.env_rollout_ratio,
+                    self.config.env_num,
+                )
+
         if component_name in self._name_to_node_dict:
             return self._name_to_node_dict[component_name]
 
         if component_name == "rollout":
             node = RolloutNode()
-        else:
+        elif component_name in ["actor", "inference"]:
             valid_gpu_num_list: list[int] = get_valid_gpu_num_list(component_name)
             node = MegatronNode(
                 role=component_name,
                 valid_gpu_nums=valid_gpu_num_list,
             )
+        elif component_name == "env":
+            node = EnvNode(self.env_profiler)
+        elif component_name == "env_rollout":
+            node = EnvRolloutNode(self.env_profiler, model_parallel_size=1)
+        else:
+            raise ValueError(f"{component_name=} is not supported")
+
         self._name_to_node_dict[component_name] = node
         return node
 
@@ -79,15 +97,25 @@ class AutoPlacementWorker:
             return self._result_cache[key]
 
         if workflow.is_node():
-            cost_per_group_batch = workflow.profile(gpu_num)
-            if cost_per_group_batch is None:
+            cost = workflow.profile(gpu_num)
+            if cost is None:
                 return None
 
-            self._result_cache[key] = SingleNodeScheduleResult(
-                total_gpu_num=gpu_num,
-                node=workflow.nodes[0],
-                cost_per_group_batch=cost_per_group_batch,
-            )
+            if self.config.task_type == "reasoning":
+                self._result_cache[key] = SingleNodeScheduleResult(
+                    total_gpu_num=gpu_num,
+                    node=workflow.nodes[0],
+                    cost_per_group_batch=cost,
+                )
+            else:
+                cost_per_group_batch = cost / self.config.rollout_batch_size
+                self._result_cache[key] = SingleNodeScheduleResult(
+                    total_gpu_num=gpu_num,
+                    node=workflow.nodes[0],
+                    cost_per_group_batch=cost_per_group_batch,
+                    total_cost=cost,
+                )
+
             return self._result_cache[key]
 
         best_res = None
@@ -142,9 +170,8 @@ def get_workflow_graph(cfg) -> dict[str, list[str]]:
             }
     else:
         return {
-            "env": ["rollout"],
-            "rollout": ["env", "actor"],
-            "actor": [],
+            "env": ["env_rollout"],
+            "env_rollout": [],
         }
 
 
