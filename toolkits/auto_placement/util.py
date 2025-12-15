@@ -71,19 +71,30 @@ def init_global_config_env(config, component_placement):
         task_type=config.runner.task_type,
         total_gpus=component_placement._cluster_num_gpus,
         env_num=config.data.env_num,
-        rollout_batch_size=config.data.rollout_batch_size,
         profile_data=config.profile_data,
+        rollout_batch_size=1,  # For actor node init
+        group_size=1,  # For actor node init
+        n_minibatches=1,  # For actor node init
         components_config={},
     )
 
-    assert "rollout" in component_placement._components
-    rollout_instance_num = component_placement.rollout_dp_size
-    rollout_world_size = component_placement.rollout_world_size
-    rollout_model_parallel_size = rollout_world_size // rollout_instance_num
-    _GLOBAL_CONFIG.components_config["env_rollout"] = Namespace(
-        model_parallel_size=rollout_model_parallel_size,
-        max_world_size=rollout_world_size,
-    )
+    for component in component_placement._components:
+        instance_num = getattr(component_placement, f"{component}_dp_size")
+        world_size = getattr(component_placement, f"{component}_world_size")
+        model_parallel_size = world_size // instance_num
+
+        if component == "rollout":
+            component = "env_rollout"
+            _GLOBAL_CONFIG.components_config[component] = Namespace(
+                model_parallel_size=model_parallel_size,
+                max_world_size=world_size,
+            )
+        else:
+            _GLOBAL_CONFIG.components_config[component] = Namespace(
+                model_parallel_size=model_parallel_size,
+                max_world_size=world_size,
+                collocated_cost_total=getattr(config.profile_data, f"{component}_cost"),
+            )
 
 
 def get_global_config():

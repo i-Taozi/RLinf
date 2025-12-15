@@ -26,7 +26,6 @@ class ScheduleMode(Enum):
     SINGLE_NODE = "single_node"
     COLLOCATED = "collocated"
     DISAGGREGATED = "disaggregated"
-    HYBRID = "hybrid"
 
 
 class ScheduleResult(ABC):
@@ -43,37 +42,27 @@ class ScheduleResult(ABC):
         if source_res is None or sink_res is None:
             return None
         if is_collocated:
-            return ScheduleResult.build_collocated_schedule_result(
-                total_gpu_num, source_res, sink_res
-            )
-        return ScheduleResult.build_disaggregated_schedule_result(
-            total_gpu_num, source_res, sink_res, warmup_group_num
-        )
-
-    @staticmethod
-    def build_collocated_schedule_result(
-        total_gpu_num: int, source_res: "ScheduleResult", sink_res: "ScheduleResult"
-    ) -> Optional["ScheduleResult"]:
-        target_modes = [ScheduleMode.COLLOCATED, ScheduleMode.SINGLE_NODE]
-        if source_res.mode in target_modes and sink_res.mode in target_modes:
-            return CollocatedScheduleResult(total_gpu_num, source_res, sink_res)
-        return None
-        return HybirdScheduleResult(total_gpu_num, source_res, sink_res)
-
-    @staticmethod
-    def build_disaggregated_schedule_result(
-        total_gpu_num: int,
-        source_res: "ScheduleResult",
-        sink_res: "ScheduleResult",
-        warmup_group_num,
-    ) -> Optional["ScheduleResult"]:
-        target_modes = [ScheduleMode.DISAGGREGATED, ScheduleMode.SINGLE_NODE]
-        if source_res.mode in target_modes and sink_res.mode in target_modes:
-            return DisaggregatedScheduleResult(
+            res = CollocatedScheduleResult(total_gpu_num, source_res, sink_res)
+        else:
+            res = DisaggregatedScheduleResult(
                 total_gpu_num, source_res, sink_res, warmup_group_num
             )
-        return None
-        return HybirdScheduleResult(total_gpu_num, source_res, sink_res)
+
+        config = get_global_config()
+
+        # In Reasoning task, hybrid schedule is not supported.
+        if config.task_type == "reasoning" and res.is_hybrid():
+            return None
+
+        # In Embodiment task, actor should run on all GPUs.
+        if config.task_type == "embodiment":
+            nodes = list(res.placement.keys())
+            if (
+                nodes[-1].role == "actor"
+                and len(res.placement[nodes[-1]]) != res.total_gpu_num
+            ):
+                return None
+        return res
 
     @staticmethod
     def find_best_schedule(
@@ -100,14 +89,21 @@ class ScheduleResult(ABC):
     def get_cost_per_group_batch(self, *args, **kwargs) -> float:
         return self.cost_per_group_batch
 
+    def is_hybrid(self) -> bool:
+        if self.mode == ScheduleMode.SINGLE_NODE:
+            return False
+
+        def _check_child_mode(self_model, child_mode) -> bool:
+            if child_mode != ScheduleMode.SINGLE_NODE and child_mode != self_model:
+                return True
+            return False
+
+        return _check_child_mode(self.mode, self.source_res.mode) or _check_child_mode(
+            self.mode, self.sink_res.mode
+        )
+
     @property
     def placement_str(self) -> str:
-        if self.mode == ScheduleMode.COLLOCATED:
-            gpu_range = list(self.placement.values())[0]
-            return (
-                ", ".join([f"{node.role}" for node in self.placement])
-                + f" : {gpu_range[0]}-{gpu_range[-1]}"
-            )
         placement_str = ""
         for node, gpu_range in self.placement.items():
             placement_str += f"{node.role} : {gpu_range[0]}-{gpu_range[-1]}\n"
@@ -140,13 +136,6 @@ class SingleNodeScheduleResult(ScheduleResult):
             cost_per_group_batch=cost_per_group_batch,
             total_cost=total_cost,
         )
-
-
-class HybirdScheduleResult(ScheduleResult):
-    def __init__(
-        self, total_gpu_num: int, source_res: ScheduleResult, sink_res: ScheduleResult
-    ):
-        raise NotImplementedError("HybirdScheduleResult is not implemented")
 
 
 class CollocatedScheduleResult(ScheduleResult):
@@ -194,30 +183,56 @@ class DisaggregatedScheduleResult(ScheduleResult):
         self.sink_res = sink_res
         self.warmup_group_num = warmup_group_num
 
-        warmup_time, bottleneck_cost = self._get_disaggregated_time()
+        cost_per_group_batch, total_cost = self._get_disaggregated_time()
         super().__init__(
             mode=ScheduleMode.DISAGGREGATED,
             total_gpu_num=total_gpu_num,
             placement=self._get_disaggregated_placement(),
-            cost_per_group_batch=warmup_time,
-            total_cost=warmup_time + bottleneck_cost,
+            cost_per_group_batch=cost_per_group_batch,
+            total_cost=total_cost,
         )
 
     def _get_disaggregated_time(self) -> tuple[float, float]:
         config = get_global_config()
+
         source_cost_per_group_batch = self.source_res.get_cost_per_group_batch(
             is_source=True
         )
         sink_cost_per_group_batch = self.sink_res.get_cost_per_group_batch(
             is_source=False
         )
-        warmup_time = (
-            source_cost_per_group_batch + sink_cost_per_group_batch
+
+        if self.source_res.mode == ScheduleMode.DISAGGREGATED:
+            source_warmup_time = self.source_res.warmup_time
+        else:
+            source_warmup_time = source_cost_per_group_batch
+
+        if self.sink_res.mode == ScheduleMode.DISAGGREGATED:
+            sink_warmup_time = self.sink_res.warmup_time
+        else:
+            sink_warmup_time = sink_cost_per_group_batch
+
+        self.warmup_time = (
+            source_warmup_time + sink_warmup_time
         ) * self.warmup_group_num
-        bottleneck_cost = max(
-            source_cost_per_group_batch, sink_cost_per_group_batch
-        ) * (config.rollout_batch_size - self.warmup_group_num)
-        return warmup_time, bottleneck_cost
+        try:
+            cost_per_group_batch = max(
+                source_cost_per_group_batch, sink_cost_per_group_batch
+            )
+        except TypeError as e:
+            print(f"[debug] TypeError: {e}")
+            print(
+                f"[debug] {self.source_res=}, source_cost_per_group_batch: {source_cost_per_group_batch}"
+            )
+            print(
+                f"[debug] {self.sink_res=}, sink_cost_per_group_batch: {sink_cost_per_group_batch}"
+            )
+            raise e
+
+        bottleneck_cost = cost_per_group_batch * (
+            config.rollout_batch_size - self.warmup_group_num
+        )
+        return cost_per_group_batch, self.warmup_time + bottleneck_cost
 
     def _get_disaggregated_placement(self) -> dict[ComponentNode, int]:
         source_placement: dict[ComponentNode, int] = self.source_res.placement

@@ -59,6 +59,8 @@ class ComponentNode(ABC):
         return hash(self.__str__())
 
     def __eq__(self, other):
+        if not isinstance(other, ComponentNode):
+            return False
         return hash(self) == hash(other)
 
 
@@ -129,32 +131,26 @@ class RolloutNode(ComponentNode):
 class EnvProfiler:
     def __init__(
         self,
-        env_profile_data: dict[int, float],
-        env_rollout_ratio: float,
+        profile_data: dict[int, float],
         total_env_num: int,
+        max_env_num_per_instance: int = -1,
     ):
-        self.data_fitter = DataFitter(env_profile_data)
+        self.data_fitter = DataFitter(profile_data)
         self.total_env_num = total_env_num
-        self.env_rollout_ratio = env_rollout_ratio
+        if max_env_num_per_instance == -1:
+            self.max_env_num_per_instance = max(profile_data.keys())
+        else:
+            self.max_env_num_per_instance = max_env_num_per_instance
 
-        self.max_env_num_per_gpu = max(env_profile_data.keys())
+    def _get_env_cost_by_single_gpu(self, env_num_per_instance: int) -> float:
+        return self.data_fitter.get_value(env_num_per_instance)
 
-    def _get_env_cost_by_single_gpu(self, env_num_per_gpu: int) -> float:
-        return self.data_fitter.get_value(env_num_per_gpu)
-
-    def get_env_cost(self, env_gpu_num: int) -> Optional[float]:
-        if self.total_env_num % env_gpu_num != 0:
+    def profile(self, instance_num: int, require_align: bool) -> Optional[float]:
+        if require_align and self.total_env_num % instance_num != 0:
             return None
-        if self.total_env_num // env_gpu_num > self.max_env_num_per_gpu:
+        if self.total_env_num // instance_num > self.max_env_num_per_instance:
             return None
-        return self._get_env_cost_by_single_gpu(self.total_env_num // env_gpu_num)
-
-    def get_rollout_cost(self, rollout_instance_num: int) -> float:
-        env_num_per_rollout_instance = self.total_env_num // rollout_instance_num
-        return (
-            self._get_env_cost_by_single_gpu(env_num_per_rollout_instance)
-            / self.env_rollout_ratio
-        )
+        return self._get_env_cost_by_single_gpu(self.total_env_num // instance_num)
 
 
 class EnvNode(ComponentNode):
@@ -168,7 +164,9 @@ class EnvNode(ComponentNode):
         config = get_global_config()
         self._gpu_num_to_cost: dict[int, float] = {}
         for gpu_num in range(1, config.total_gpus + 1):
-            self._gpu_num_to_cost[gpu_num] = self.profiler.get_env_cost(gpu_num)
+            self._gpu_num_to_cost[gpu_num] = self.profiler.profile(
+                instance_num=gpu_num, require_align=True
+            )
 
 
 class EnvRolloutNode(ComponentNode):
@@ -192,8 +190,8 @@ class EnvRolloutNode(ComponentNode):
         for gpu_num in range(1, config.total_gpus + 1):
             if gpu_num % self.model_parallel_size != 0:
                 continue
-            self._gpu_num_to_cost[gpu_num] = self.profiler.get_rollout_cost(
-                gpu_num // self.model_parallel_size
+            self._gpu_num_to_cost[gpu_num] = self.profiler.profile(
+                instance_num=gpu_num // self.model_parallel_size, require_align=False
             )
 
 

@@ -49,14 +49,6 @@ class AutoPlacementWorker:
         self._init_workflow(graph)
 
     def get_node(self, component_name: str) -> ComponentNode:
-        if self.config.task_type != "reasoning":
-            if not hasattr(self, "env_profiler"):
-                self.env_profiler = EnvProfiler(
-                    self.config.profile_data.env_profile_data,
-                    self.config.profile_data.env_rollout_ratio,
-                    self.config.env_num,
-                )
-
         if component_name in self._name_to_node_dict:
             return self._name_to_node_dict[component_name]
 
@@ -69,9 +61,22 @@ class AutoPlacementWorker:
                 valid_gpu_nums=valid_gpu_num_list,
             )
         elif component_name == "env":
-            node = EnvNode(self.env_profiler)
+            node = EnvNode(
+                profiler=EnvProfiler(
+                    self.config.profile_data.env_profile_data,
+                    self.config.env_num,
+                )
+            )
         elif component_name == "env_rollout":
-            node = EnvRolloutNode(self.env_profiler, model_parallel_size=1)
+            node = EnvRolloutNode(
+                profiler=EnvProfiler(
+                    self.config.profile_data.rollout_profile_data,
+                    self.config.env_num,
+                ),
+                model_parallel_size=self.components_config[
+                    "env_rollout"
+                ].model_parallel_size,
+            )
         else:
             raise ValueError(f"{component_name=} is not supported")
 
@@ -101,20 +106,20 @@ class AutoPlacementWorker:
             if cost is None:
                 return None
 
+            # For reasoning task, the cost is the cost per group batch.
             if self.config.task_type == "reasoning":
-                self._result_cache[key] = SingleNodeScheduleResult(
-                    total_gpu_num=gpu_num,
-                    node=workflow.nodes[0],
-                    cost_per_group_batch=cost,
-                )
-            else:
-                cost_per_group_batch = cost / self.config.rollout_batch_size
-                self._result_cache[key] = SingleNodeScheduleResult(
-                    total_gpu_num=gpu_num,
-                    node=workflow.nodes[0],
-                    cost_per_group_batch=cost_per_group_batch,
-                    total_cost=cost,
-                )
+                cost_per_group_batch = cost
+                total_cost = cost * self.config.rollout_batch_size
+            else:  # For embodiment task, the cost means total cost.
+                cost_per_group_batch = cost / self.config.env_num
+                total_cost = cost
+
+            self._result_cache[key] = SingleNodeScheduleResult(
+                total_gpu_num=gpu_num,
+                node=workflow.nodes[0],
+                cost_per_group_batch=cost_per_group_batch,
+                total_cost=total_cost,
+            )
 
             return self._result_cache[key]
 
@@ -143,6 +148,7 @@ class AutoPlacementWorker:
                 disaggregated_res = ScheduleResult.merger_schedule_results(
                     gpu_num, source_res, sink_res, is_collocated=False
                 )
+
                 best_res = ScheduleResult.find_best_schedule(
                     best_res, disaggregated_res
                 )
@@ -171,7 +177,8 @@ def get_workflow_graph(cfg) -> dict[str, list[str]]:
     elif cfg.runner.task_type == "embodiment":
         return {
             "env": ["env_rollout"],
-            "env_rollout": [],
+            "env_rollout": ["actor"],
+            "actor": [],
         }
     else:
         raise ValueError(f"{cfg.runner.task_type=} is not supported")
@@ -189,7 +196,10 @@ def main(cfg):
 
     schedule_result: ScheduleResult = auto_placement_worker.run()
 
-    if schedule_result.mode == ScheduleMode.COLLOCATED:
+    if (
+        schedule_result.mode == ScheduleMode.COLLOCATED
+        and not schedule_result.is_hybrid()
+    ):
         res = (
             ", ".join(
                 [

@@ -63,8 +63,8 @@ def get_mock_config_reasoning():
     mock_cfg.rollout.gpu_memory_utilization = 0.55
 
     # Profile data
-    mock_cfg.profile_data.actor_cost = 159
-    mock_cfg.profile_data.rollout_cost = 195
+    mock_cfg.profile_data.actor_cost = 101
+    mock_cfg.profile_data.rollout_cost = 224
     mock_cfg.profile_data.inference_cost = 10
 
     # Model size
@@ -85,35 +85,62 @@ def get_mock_config_reasoning():
     return mock_cfg, mock_component_placement
 
 
-def get_mock_config_embodiment():
+def get_mock_config_embodiment(env_type: str):
     mock_cfg = MagicMock()
     mock_cfg.runner.task_type = "embodiment"
 
-    mock_cfg.data.env_num = 16 * 8 * 3
     mock_cfg.data.rollout_batch_size = 1024
-
-    mock_cfg.profile_data.env_profile_data = {
-        4: 0.27,
-        8: 0.42,
-        16: 0.76,
-        32: 1.37,
-        64: 2.4,
-    }
-    mock_cfg.profile_data.env_rollout_ratio = 1 / 3
+    if env_type == "libero":
+        mock_cfg.data.env_num = 64
+        mock_cfg.profile_data.env_profile_data = {
+            4: 0.61,
+            8: 1.23,
+            16: 2.46,
+            32: 4.66,
+            64: 18.5,
+        }
+        mock_cfg.profile_data.rollout_profile_data = {
+            4: 0.6,
+            8: 1.01,
+            16: 2.12,
+            32: 3.72,
+            64: 15.3,
+        }
+    elif env_type == "maniskill":
+        mock_cfg.data.env_num = 40
+        mock_cfg.profile_data.env_profile_data = {
+            10: 0.8,
+            20: 0.8,
+            30: 0.85,
+            40: 0.85,
+        }
+        mock_cfg.profile_data.rollout_profile_data = {
+            10: 0.4,
+            20: 0.6,
+            30: 0.85,
+            40: 1.15,
+        }
 
     # Model size
     mock_component_placement = MagicMock()
-    mock_component_placement._cluster_num_gpus = 4 * 8
-    mock_component_placement._components = [
-        "env",
-        "rollout",
-    ]
+    mock_component_placement._cluster_num_gpus = 4
+    mock_component_placement._components = ["env", "rollout", "actor"]
     mock_component_placement.rollout_dp_size = (
         mock_component_placement._cluster_num_gpus
     )
     mock_component_placement.rollout_world_size = (
         mock_component_placement._cluster_num_gpus
     )
+
+    mock_cfg.algorithm.group_size = 1
+    mock_cfg.profile_data.actor_cost = 100
+    mock_component_placement.actor_dp_size = (
+        mock_component_placement._cluster_num_gpus // 2
+    )
+    mock_component_placement.actor_world_size = (
+        mock_component_placement._cluster_num_gpus
+    )
+
     return mock_cfg, mock_component_placement
 
 
@@ -267,7 +294,9 @@ class TestAutoPlacementWorkerForReasoning:
         assert res.total_gpu_num == mock_component_placement._cluster_num_gpus
         assert res.mode == ScheduleMode.DISAGGREGATED
 
-        assert len(res.placement[auto_placement_worker.get_node("rollout")]) == 80
+        assert len(res.placement[auto_placement_worker.get_node("rollout")]) == 80, (
+            f"{res.placement_str}"
+        )
         assert len(res.placement[auto_placement_worker.get_node("inference")]) == 16, (
             f"{res}"
         )
@@ -280,85 +309,46 @@ class TestAutoPlacementWorkerForReasoning:
 class TestAutoPlacementWorkerForEmbodiment:
     """Tests for the SchedulerTask class."""
 
-    def test_disaggregated(self):
+    def test_libero_embodiment(self):
         """Test SchedulerTask initialization."""
         # Create a mock config
-        mock_cfg, mock_component_placement = get_mock_config_embodiment()
+        mock_cfg, mock_component_placement = get_mock_config_embodiment(
+            env_type="libero"
+        )
 
         graph = {
             "env": ["env_rollout"],
-            "env_rollout": [],
+            "env_rollout": ["actor"],
+            "actor": [],
         }
 
-        def test_env_rollout_ratio(env_rollout_ratio):
-            mock_cfg.profile_data.env_rollout_ratio = env_rollout_ratio
-            auto_placement_worker = AutoPlacementWorker(
-                mock_cfg, mock_component_placement, graph
-            )
-            res = auto_placement_worker.run()
-            assert isinstance(res, ScheduleResult)
-            assert res.total_gpu_num == mock_component_placement._cluster_num_gpus
-            assert res.mode == ScheduleMode.DISAGGREGATED
-
-            rollout_gpu_num = len(
-                res.placement[auto_placement_worker.get_node("env_rollout")]
-            )
-            env_gpu_num = len(res.placement[auto_placement_worker.get_node("env")])
-            assert (
-                rollout_gpu_num + env_gpu_num
-                == mock_component_placement._cluster_num_gpus
-            )
-
-            assert env_gpu_num / rollout_gpu_num == env_rollout_ratio
-
-        test_env_rollout_ratio(1 / 3)
-        test_env_rollout_ratio(3 / 1)
-
-    def get_collocated_mock_config(self):
-        mock_cfg = MagicMock()
-        mock_cfg.runner.task_type = "embodiment"
-
-        mock_cfg.data.env_num = 64 * 2
-        mock_cfg.data.rollout_batch_size = 1024
-
-        mock_cfg.profile_data.env_profile_data = {
-            4: 0.27,
-            8: 0.42,
-            16: 0.76,
-            32: 1.37,
-            64: 2.4,
-        }
-        mock_cfg.profile_data.env_rollout_ratio = 2 / 1
-
-        # Model size
-        mock_component_placement = MagicMock()
-        mock_component_placement._cluster_num_gpus = 1 * 8
-        mock_component_placement._components = [
-            "env",
-            "rollout",
-        ]
-        mock_component_placement.rollout_dp_size = (
-            mock_component_placement._cluster_num_gpus
+        auto_placement_worker = AutoPlacementWorker(
+            mock_cfg, mock_component_placement, graph
         )
-        mock_component_placement.rollout_world_size = (
-            mock_component_placement._cluster_num_gpus
+        res = auto_placement_worker.run()
+        assert res.total_gpu_num == mock_component_placement._cluster_num_gpus
+        assert isinstance(res, ScheduleResult)
+        assert res.mode == ScheduleMode.COLLOCATED
+
+    def test_maniskill_embodiment(self):
+        mock_cfg, mock_component_placement = get_mock_config_embodiment(
+            env_type="maniskill"
         )
-
-        return mock_cfg, mock_component_placement
-
-    def test_collocated(self):
-        mock_cfg, mock_component_placement = self.get_collocated_mock_config()
-
         graph = {
             "env": ["env_rollout"],
-            "env_rollout": [],
+            "env_rollout": ["actor"],
+            "actor": [],
         }
         auto_placement_worker = AutoPlacementWorker(
             mock_cfg, mock_component_placement, graph
         )
         res = auto_placement_worker.run()
         assert res.total_gpu_num == mock_component_placement._cluster_num_gpus
-        assert res.mode == ScheduleMode.COLLOCATED
+        assert res.placement[auto_placement_worker.get_node("actor")] == range(4)
+        assert res.placement[auto_placement_worker.get_node("env")] == range(0, 1)
+        assert res.placement[auto_placement_worker.get_node("env_rollout")] == range(
+            1, 4
+        )
 
 
 if __name__ == "__main__":
