@@ -14,7 +14,7 @@
 
 import os
 import sys
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -22,27 +22,11 @@ import pytest
 sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), "../../toolkits/auto_placement")
 )
-# Add RLinf to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from auto_placement_worker import AutoPlacementWorker, get_workflow_graph
 from node import ComponentNode, MegatronNode, RolloutNode, SccNode
 from placement import ScheduleMode, ScheduleResult
 from util import init_global_config
 from workflow import Workflow, traverse_st_cuts
-
-try:
-    # Mock the missing dependencies for auto_placement_worker
-    sys.modules["rlinf.config"] = Mock()
-    sys.modules["rlinf.config"].validate_cfg = Mock()
-    sys.modules["rlinf.scheduler"] = Mock()
-    sys.modules["rlinf.utils"] = Mock()
-    sys.modules["rlinf.utils.placement"] = Mock()
-    sys.modules["rlinf.utils.placement.ModelParallelComponentPlacement"] = Mock()
-    from auto_placement_worker import AutoPlacementWorker, get_workflow_graph
-
-    IMPORTS_AVAILABLE = True
-except ImportError as e:
-    IMPORTS_AVAILABLE = False
-    pytestmark = pytest.mark.skip(f"Auto placement modules not available: {e}")
 
 
 def get_mock_config_reasoning():
@@ -270,9 +254,6 @@ class TestWorkflow:
         ]
 
 
-@pytest.mark.skipif(
-    not IMPORTS_AVAILABLE, reason="Auto placement modules not available"
-)
 class TestAutoPlacementWorkerForReasoning:
     """Tests for the SchedulerTask class."""
 
@@ -303,9 +284,6 @@ class TestAutoPlacementWorkerForReasoning:
         assert len(res.placement[auto_placement_worker.get_node("actor")]) == 32
 
 
-@pytest.mark.skipif(
-    not IMPORTS_AVAILABLE, reason="Auto placement modules not available"
-)
 class TestAutoPlacementWorkerForEmbodiment:
     """Tests for the SchedulerTask class."""
 
